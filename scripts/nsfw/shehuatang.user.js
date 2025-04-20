@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Shehuatang 下载助手
 // @namespace    http://tampermonkey.net/
-// @version      2025-04-20
-// @description  收集奢华堂页面图片链接并打包下载为 ZIP 文件
+// @version      2025-04-21
+// @description  收集色花堂页面图片链接并打包下载为 ZIP 文件
 // @author       nerdneilsfield <dengqi935@gmail.com>
 // @match        https://sehuatang.net/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=sehuatang.net
@@ -16,6 +16,7 @@
 // ==/UserScript==
 
 /* global JSZip */ // 告诉 linter JSZip 是全局可用的 (通过 @require 引入)
+/* global saveAs */ // 告诉 linter saveAs 是全局可用的 (通过 @require 引入)
 
 (function () {
   "use strict";
@@ -534,6 +535,7 @@
             console.log("saveAs 调用完成."); // <-- Added log
 
             // 显示最终结果
+            let zippedBytes = content.byteLength;
             let resultMessage = `ZIP 文件 (${folderName}.zip) 已开始下载！\n成功下载 ${downloadedCount} 张图片。`;
             if (failedDownloads.length > 0) {
               resultMessage += `\n${
@@ -541,6 +543,8 @@
               } 张图片下载失败:\n${failedDownloads.join("\n")}`;
               console.warn("以下图片下载失败:", failedDownloads);
             }
+            resultMessage += `\n原始大小 ${(totalBytes / 1024 / 1024).toFixed(2)} MB\n`;
+            resultMessage += `\n压缩后大小 ${(zippedBytes / 1024 / 1024).toFixed(2)} MB`;
             alert(resultMessage);
           })
           .catch(function (err) {
