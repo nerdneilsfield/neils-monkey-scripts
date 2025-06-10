@@ -6,7 +6,6 @@
 // @author       Gemini
 // @match        https://www.zhihu.com/question/*
 // @require      https://cdn.jsdelivr.net/npm/turndown@7.2.0/lib/turndown.umd.js
-// @run-at       document-idle
 // @downloadURL https://github.com/nerdneilsfield/neils-monkey-scripts/raw/refs/heads/master/scripts/forum/zhihu.user.js
 // @updateURL https://github.com/nerdneilsfield/neils-monkey-scripts/raw/refs/heads/master/scripts/forum/zhihu.user.js
 // @grant        none
