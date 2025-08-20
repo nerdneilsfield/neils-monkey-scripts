@@ -11,6 +11,8 @@
 // @grant        GM_xmlhttpRequest
 // @grant        GM_download
 // @connect      ieeexplore.ieee.org
+// @downloadURL https://github.com/nerdneilsfield/neils-monkey-scripts/raw/refs/heads/master/scripts/scholar/ieee-markdown-exporter.user.js
+// @updateURL https://github.com/nerdneilsfield/neils-monkey-scripts/raw/refs/heads/master/scripts/scholar/ieee-markdown-exporter.user.js
 // ==/UserScript==
 
 (function () {

@@ -3,7 +3,7 @@
 // @namespace    http://tampermonkey.net/
 // @version      0.5
 // @description  在知乎问题页提供下载全部回答或选择部分回答导出为 Markdown 的功能
-// @author       Gemini
+// @author       Qi Deng
 // @match        https://www.zhihu.com/question/*
 // @require      https://cdn.jsdelivr.net/npm/turndown@7.2.0/lib/turndown.umd.js
 // @downloadURL https://github.com/nerdneilsfield/neils-monkey-scripts/raw/refs/heads/master/scripts/forum/zhihu.user.js
