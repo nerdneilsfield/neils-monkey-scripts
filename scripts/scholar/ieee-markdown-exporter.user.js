@@ -396,6 +396,21 @@
       return markdown;
     }
 
+    renderAbstract(raw) {
+      try {
+        // 把 meta.abstract 包进一个容器，用现有 processTextContent 解析公式/脚注/实体
+        const doc = new DOMParser().parseFromString(`<div id="__abs__">${raw}</div>`, 'text/html');
+        const html = doc.body.querySelector('#__abs__')?.innerHTML ?? String(raw);
+        let md = this.processTextContent(html);
+        // 只在数学环境内解码 &lt; &amp; 等实体，避免正文被误动
+        md = this.decodeEntitiesInsideMath(md);
+        return md;
+      } catch {
+        // 兜底：当纯文本走一遍轻解析
+        return this.processTextContent(String(raw));
+      }
+    }
+
     // 更健壮的 HTML 实体解码：支持数值(十进制/十六进制)、常见命名实体、二次转义；NBSP→空格
     _decodeEntities(input) {
       if (!input) return '';
@@ -850,67 +865,72 @@
       return alt;
     }
 
-    processFigure(figure) {
-      let markdown = "";
 
-      // 处理图片
-      const imgWrap = figure.querySelector(".img-wrap");
-      const link = imgWrap?.querySelector("a");
-      const img = imgWrap?.querySelector("img");
+    // 忽略：公式切片/小图标/双小图
+    _shouldIgnoreImageUrl(u) {
+      const s = (u || '').toLowerCase();
+      return /eqinline/.test(s) || /icon\.support\.gif$/.test(s) || /-small-small\./.test(s);
+    }
 
-      if (img) {
-        // 优先使用large版本的链接
-        let imageSrc = img.src;
-        if (link && link.href) {
-          imageSrc = link.href;
-          // 确保使用large版本
-          if (imageSrc.includes("small")) {
-            imageSrc = imageSrc.replace("small", "large");
-          }
-        }
+    // 规范化：相对 → 绝对；small → large
+    _sanitizeImageHref(href) {
+      let u = href || '';
+      if (u.startsWith('/')) u = `https://ieeexplore.ieee.org${u}`;
+      u = u.replace(/(\b|-)small(\b|-)/g, 'large');  // 尽量取大图
+      return u;
+    }
 
-        // 处理相对路径
-        if (imageSrc.startsWith("/")) {
-          imageSrc = `https://ieeexplore.ieee.org${imageSrc}`;
-        }
+    // 在多个候选中挑“最佳”一张
+    _selectBestFigureImage(urls) {
+      const cand = (urls || [])
+        .map(u => this._sanitizeImageHref(u))
+        .filter(u => !!u && !this._shouldIgnoreImageUrl(u));
 
-        const imageData = {
-          src: imageSrc,
-          alt: img.alt || "",
-          id: this.images.length + 1,
-        };
+      // 1) 强偏好 fig-X-source-*（整幅图）
+      let best = cand.find(u => /fig-\d+-source-/i.test(u));
+      if (best) return best;
 
-        this.images.push(imageData);
+      // 2) 次选含 /fig- 或 -fig- 的
+      best = cand.find(u => /\/fig[-_]/i.test(u) || /-fig[-_]/i.test(u));
+      if (best) return best;
 
-
-        markdown += `\n![${this.shortImageAlt(imageData.alt)}](${imageData.src
-          })\n\n`;
-
-        // 处理图片标题
-        const figcaption = figure.querySelector(".figcaption");
-        if (figcaption) {
-          const title = figcaption.querySelector(".title");
-          const figContent = figcaption.querySelector("fig");
-
-          let captionText = "";
-          if (title) {
-            captionText += title.textContent.trim();
-          }
-          if (figContent) {
-            let figText = figContent.textContent.trim();
-            if (figText) {
-              captionText += (captionText ? " " : "") + figText;
-            }
-          }
-
-          if (captionText) {
-            // captionText = this.mergeParagraphToOneLine(captionText);
-            markdown += `*${captionText}*\n\n`;
-          }
-        }
+      if (typeof this.log === 'function') {
+        this.log(`figure: candidates=${urls.length} selected=${best ? best.split('/').pop() : 'none'}`);
       }
 
-      return markdown;
+      // 3) 最后退：第一张非忽略
+      return cand[0] || null;
+    }
+
+    processFigure(figure) {
+      let md = '';
+
+      // 收集候选 URL（优先 a[href]，其次 img[src]）
+      const urls = [];
+      figure.querySelectorAll('.img-wrap').forEach(w => {
+        const a = w.querySelector('a'); if (a && a.href) urls.push(a.href);
+        const img = w.querySelector('img'); if (img && img.src) urls.push(img.src);
+      });
+
+      const best = this._selectBestFigureImage(urls);
+      if (best) {
+        const imageData = { src: best, alt: '', id: this.images.length + 1 };
+        this.images.push(imageData);
+        md += `\n![${imageData.alt || `Figure ${imageData.id}`}](${imageData.src})\n\n`;
+      } else {
+        // 取不到就只给图题并记一笔：不把“假图”写进 markdown
+        if (typeof this.log === 'function') this.log('figure: skip image (eqinline or none)');
+      }
+
+      // 图题
+      const cap = figure.querySelector('.figcaption');
+      if (cap) {
+        const title = cap.querySelector('.title')?.textContent?.trim() || '';
+        const body = cap.querySelector('fig')?.textContent?.trim() || '';
+        const text = [title, body].filter(Boolean).join(' ');
+        if (text) md += `*${this.processTextContent(text)}*\n\n`;
+      }
+      return md;
     }
 
     processTable(tableEl) {
@@ -986,6 +1006,12 @@
         (_, anchor, number) => `[^${this.getOrCreateFootnote(anchor || `ref${number}`)}]`
       );
 
+      // 脚注引用（与参考文献分开）
+      text = text.replace(
+        /<a[^>]*ref-type="fn"[^>]*anchor="([^"]+)"[^>]*>[\s\S]*?<\/a>/gi,
+        (_, id) => `[^${this.getOrCreateFootnote(id)}]`
+      );
+
       // (C) 行间公式：只抽取 tex-math 的内容，剥定界后统一成块级 $$…$$
       text = text.replace(
         /<disp-formula[^>]*>[\s\S]*?<tex-math[^>]*>([\s\S]*?)<\/tex-math>[\s\S]*?<\/disp-formula>/gi,
@@ -1048,7 +1074,7 @@
       // 摘要放在作者信息之前
       if (meta.abstract) {
         header += "## Abstract\n\n";
-        header += meta.abstract + "\n\n";
+        header += this.renderAbstract(meta.abstract) + "\n\n";
       }
 
       // 作者信息
