@@ -1,0 +1,1845 @@
+<?xml
+version="1.0" encoding="UTF-8"?>
+<div id="BodyWrapper" class="ArticlePage" xmlns:ieee="http://www.ieeexplore.ieee.org">
+    <div id="article">
+        <div class="section" id="sec1">
+            <div class="header article-hdr">
+                <div class="kicker">SECTION 1</div>
+                <h2>Introduction</h2>
+            </div>
+            <p>
+                The most computationally expensive part of many computer vision algorithms consists of searching for the most
+ similar matches to high-dimensional vectors, also referred to as nearest neighbor matching. Having an efficient
+ algorithm for performing fast nearest neighbor matching in large data sets can bring speed improvements of several
+ orders of magnitude to many applications. Examples of such problems include finding the best matches for local image
+ features in large data sets <a ref-type="bibr" anchor="ref1" id="context_ref_1_1" data-range="ref1" href="javascript:void()">[1]</a>
+                <a ref-type="bibr" anchor="ref2" id="context_ref_2_1" data-range="ref2" href="javascript:void()">[2]</a>
+                clustering local features into visual words using the k-means or similar algorithms <a ref-type="bibr" anchor="ref3" id="context_ref_3_1" data-range="ref3" href="javascript:void()">[3]</a>
+                , global image feature matching for scene recognition <a ref-type="bibr" anchor="ref4" id="context_ref_4_1" data-range="ref4" href="javascript:void()">[4]</a>
+                , human pose
+ estimation <a ref-type="bibr" anchor="ref5" id="context_ref_5_1" data-range="ref5" href="javascript:void()">[5]</a>
+                , matching deformable shapes for object recognition 
+<a ref-type="bibr" anchor="ref6" id="context_ref_6_1" data-range="ref6" href="javascript:void()">[6]</a>
+                or performing normalized cross-correlation (NCC) to compare image patches
+ in large data sets <a ref-type="bibr" anchor="ref7" id="context_ref_7_1" data-range="ref7" href="javascript:void()">[7]</a>
+                . The nearest neighbor search problem is also of major
+ importance in many other applications, including machine learning, document retrieval, data compression,
+ bio-informatics, and data analysis.
+            </p>
+            <p>
+                It has been shown that using large training sets is key to obtaining good real-life performance from many computer
+ vision methods <a ref-type="bibr" anchor="ref2" id="context_ref_2_1" data-range="ref2" href="javascript:void()">[2]</a>
+                <a ref-type="bibr" anchor="ref4" id="context_ref_4_1" data-range="ref4" href="javascript:void()">[4]</a>
+                <a ref-type="bibr" anchor="ref7" id="context_ref_7_1" data-range="ref7" href="javascript:void()">[7]</a>
+                . Today the Internet is a vast resource for such training data 
+<a ref-type="bibr" anchor="ref8" id="context_ref_8_1" data-range="ref8" href="javascript:void()">[8]</a>
+                , but for large data sets the performance of the algorithms employed quickly
+ becomes a key issue.
+            </p>
+            <p>When working with high dimensional features, as with most of those encountered in computer vision applications
+ (image patches, local descriptors, global image descriptors), there is often no known nearest-neighbor search
+ algorithm that is exact and has acceptable performance. To obtain a speed improvement, many practical applications are
+ forced to settle for an approximate search, in which not all the neighbors returned are exact, meaning some are
+ approximate but typically still close to the exact neighbors. In practice it is common for approximate nearest
+ neighbor search algorithms to provide more than 95 percent of the correct neighbors and still be two or more orders of
+ magnitude faster than linear search. In many cases the nearest neighbor search is just a part of a larger application
+ containing other approximations and there is very little loss in performance from using approximate rather than exact
+ neighbors.</p>
+            <p>In this paper we evaluate the most promising nearest-neighbor search algorithms in the literature, propose new
+ algorithms and improvements to existing ones, present a method for performing automatic algorithm selection and
+ parameter optimization, and discuss the problem of scaling to very large data sets using compute clusters. We have
+ released all this work as an open source library named fast library for approximate nearest neighbors (FLANN).</p>
+            <div class="section_2" id="sec1.1">
+                <h3>1.1 Definitions and Notation</h3>
+                <p class="has-inline-formula">
+                    In this paper we are concerned with the problem of efficient nearest neighbor search in metric spaces. The nearest
+ neighbor search in a metric space can be defined as follows: given a set of points 
+                    <inline-formula class="inline-formula">
+                        <tex-math>$P=\{
+ p_1, p_2, \ldots, p_n\}$</tex-math>
+                    </inline-formula>
+                    in a metric space 
+                    <inline-formula class="inline-formula">
+                        <tex-math>$M$</tex-math>
+                    </inline-formula>
+                    and a query point 
+                    <inline-formula class="inline-formula">
+                        <tex-math>$q \in M$</tex-math>
+                    </inline-formula>
+                    , find the element 
+                    <inline-formula class="inline-formula">
+                        <tex-math>${\rm NN}(q,P) \in P$</tex-math>
+                    </inline-formula>
+                    that is the closest to 
+
+                    <inline-formula class="inline-formula">
+                        <tex-math>$q$</tex-math>
+                    </inline-formula>
+                    with respect to a metric distance 
+                    <inline-formula class="inline-formula">
+                        <tex-math>$ d :M \times M
+ \rightarrow {\bb R}$</tex-math>
+                    </inline-formula>
+                    :
+
+                    <disp-formula id="" class="display-formula">
+                        <tex-math notation="">$$
+{\rm NN}(q,P) = arg min_{x\in P}\ d(q,x).
+$$</tex-math>
+                        <span class="formula">
+                            <span class="link">View Source</span>
+                            <img aria-describedby="qtip-0" style="display:inline;" title="Right-click on figure or equation for MathML and additional features." data-hasqtip="0" class="qtooltip moreInfo" alt="Right-click on figure for MathML and additional features." src="/assets/img/icon.support.gif" border="0" height="20" width="24"/>
+                            <span class="tex tex2jax_ignore" style="display:none;">{\rm NN}(q,P) = arg min_{x\in P}\ d(q,x).
+</span>
+                        </span>
+                    </disp-formula>
+                </p>
+                <p class="has-inline-formula">
+                    The <i>nearest neighbor problem</i>
+                    consists of finding a method to pre-process the set 
+                    <inline-formula class="inline-formula">
+                        <tex-math>$P$</tex-math>
+                    </inline-formula>
+                    such that the operation 
+                    <inline-formula class="inline-formula">
+                        <tex-math>${\rm NN}(q,P)$</tex-math>
+                    </inline-formula>
+                    can be performed efficiently.
+                </p>
+                <p class="has-inline-formula">
+                    We are often interested in finding not just the first closest neighbor, but several closest neighbors. In this case,
+ the search can be performed in several ways, depending on the number of neighbors returned and their distance to the
+ query point: <i>K-nearest neighbor (KNN) search</i>
+                    where the goal is to find the closest 
+                    <inline-formula class="inline-formula">
+                        <tex-math>$K$</tex-math>
+                    </inline-formula>
+                    points from the query point and <i>radius nearest neighbor search (RNN)</i>
+                    , where the goal
+ is to find all the points located closer than some distance 
+                    <inline-formula class="inline-formula">
+                        <tex-math>$R$</tex-math>
+                    </inline-formula>
+                    from the query point.
+                </p>
+                <p class="has-inline-formula">
+                    We define the <i>K-nearest neighbor</i>
+                    search more formally in the following manner:
+
+                    <disp-formula id="" class="display-formula">
+                        <tex-math notation="">$$
+{\rm KNN}(q,P,K) = A,
+$$</tex-math>
+                        <span class="formula">
+                            <span class="link">View Source</span>
+                            <img aria-describedby="qtip-0" style="display:inline;" title="Right-click on figure or equation for MathML and additional features." data-hasqtip="0" class="qtooltip moreInfo" alt="Right-click on figure for MathML and additional features." src="/assets/img/icon.support.gif" border="0" height="20" width="24"/>
+                            <span class="tex tex2jax_ignore" style="display:none;">{\rm KNN}(q,P,K) = A,
+</span>
+                        </span>
+                    </disp-formula>
+                    where A is a set
+ that satisfies the following conditions:
+
+                    <disp-formula id="" class="display-formula">
+                        <tex-math notation="">$$
+\vert A\vert = K, A \subseteq P
+$$</tex-math>
+                        <span class="formula">
+                            <span class="link">View Source</span>
+                            <img aria-describedby="qtip-0" style="display:inline;" title="Right-click on figure or equation for MathML and additional features." data-hasqtip="0" class="qtooltip moreInfo" alt="Right-click on figure for MathML and additional features." src="/assets/img/icon.support.gif" border="0" height="20" width="24"/>
+                            <span class="tex tex2jax_ignore" style="display:none;">\vert A\vert = K, A \subseteq P
+</span>
+                        </span>
+                    </disp-formula>
+                    <disp-formula id="" class="display-formula">
+                        <tex-math notation="">$$
+\forall x\in A, y \in P-A, d(q,x)\le d(q,y).
+$$</tex-math>
+                        <span class="formula">
+                            <span class="link">View Source</span>
+                            <img aria-describedby="qtip-0" style="display:inline;" title="Right-click on figure or equation for MathML and additional features." data-hasqtip="0" class="qtooltip moreInfo" alt="Right-click on figure for MathML and additional features." src="/assets/img/icon.support.gif" border="0" height="20" width="24"/>
+                            <span class="tex tex2jax_ignore" style="display:none;">\forall x\in A, y \in P-A, d(q,x)\le d(q,y).
+</span>
+                        </span>
+                    </disp-formula>
+                    The K-nearest
+ neighbor search has the property that it will always return exactly 
+                    <inline-formula class="inline-formula">
+                        <tex-math>$K$</tex-math>
+                    </inline-formula>
+                    neighbors (if there
+ are at least 
+                    <inline-formula class="inline-formula">
+                        <tex-math>$K$</tex-math>
+                    </inline-formula>
+                    points in 
+                    <inline-formula class="inline-formula">
+                        <tex-math>$P$</tex-math>
+                    </inline-formula>
+                    ).
+                </p>
+                <p>
+                    The <i>radius nearest neighbor</i>
+                    search can be defined as follows:
+
+                    <disp-formula id="" class="display-formula">
+                        <tex-math notation="">$$
+{\rm RNN}(q,P,R) = \{ p\in P, d(q,p)&lt;R\} .
+$$</tex-math>
+                        <span class="formula">
+                            <span class="link">View Source</span>
+                            <img aria-describedby="qtip-0" style="display:inline;" title="Right-click on figure or equation for MathML and additional features." data-hasqtip="0" class="qtooltip moreInfo" alt="Right-click on figure for MathML and additional features." src="/assets/img/icon.support.gif" border="0" height="20" width="24"/>
+                            <span class="tex tex2jax_ignore" style="display:none;">{\rm RNN}(q,P,R) = \{ p\in P, d(q,p)&lt;R\} .
+</span>
+                        </span>
+                    </disp-formula>
+                </p>
+                <p class="has-inline-formula">
+                    Depending on how the value 
+                    <inline-formula class="inline-formula">
+                        <tex-math>$R$</tex-math>
+                    </inline-formula>
+                    is chosen, the radius search can
+ return any number of points between zero and the whole data set. In practice, passing a large value 
+                    <inline-formula class="inline-formula">
+                        <tex-math>$R$</tex-math>
+                    </inline-formula>
+                    to radius search and having the search return a large number of points is often very inefficient. 
+<i>Radius K-nearest neighbor</i>
+                    (RKNN) search, is a combination of K-nearest neighbor search and radius
+ search, where a limit can be placed on the number of points that the radius search should return:
+
+                    <disp-formula id="" class="display-formula">
+                        <tex-math notation="">$$
+{\rm RKNN}(q,P,K,R) = A,
+$$</tex-math>
+                        <span class="formula">
+                            <span class="link">View Source</span>
+                            <img aria-describedby="qtip-0" style="display:inline;" title="Right-click on figure or equation for MathML and additional features." data-hasqtip="0" class="qtooltip moreInfo" alt="Right-click on figure for MathML and additional features." src="/assets/img/icon.support.gif" border="0" height="20" width="24"/>
+                            <span class="tex tex2jax_ignore" style="display:none;">{\rm RKNN}(q,P,K,R) = A,
+</span>
+                        </span>
+                    </disp-formula>
+                    such that
+
+                    <disp-formula id="" class="display-formula">
+                        <tex-math notation="">$$
+\vert A\vert \le K, A \subseteq P
+$$</tex-math>
+                        <span class="formula">
+                            <span class="link">View Source</span>
+                            <img aria-describedby="qtip-0" style="display:inline;" title="Right-click on figure or equation for MathML and additional features." data-hasqtip="0" class="qtooltip moreInfo" alt="Right-click on figure for MathML and additional features." src="/assets/img/icon.support.gif" border="0" height="20" width="24"/>
+                            <span class="tex tex2jax_ignore" style="display:none;">\vert A\vert \le K, A \subseteq P
+</span>
+                        </span>
+                    </disp-formula>
+                    <disp-formula id="" class="display-formula">
+                        <tex-math notation="">$$
+\forall x \in A, y \in P-A, d(q,x)&lt;R\; {\rm and }\; d(q,x)\le d(q,y) .
+$$</tex-math>
+                        <span class="formula">
+                            <span class="link">View Source</span>
+                            <img aria-describedby="qtip-0" style="display:inline;" title="Right-click on figure or equation for MathML and additional features." data-hasqtip="0" class="qtooltip moreInfo" alt="Right-click on figure for MathML and additional features." src="/assets/img/icon.support.gif" border="0" height="20" width="24"/>
+                            <span class="tex tex2jax_ignore" style="display:none;">\forall x \in A, y \in P-A, d(q,x)&lt;R\; {\rm and }\; d(q,x)\le d(q,y) .
+</span>
+                        </span>
+                    </disp-formula>
+                </p>
+            </div>
+        </div>
+        <div class="section" id="sec2">
+            <div class="header article-hdr">
+                <div class="kicker">SECTION 2</div>
+                <h2>Background</h2>
+            </div>
+            <p>Nearest-neighbor search is a fundamental part of many computer vision algorithms and of significant importance in
+ many other fields, so it has been widely studied. This section presents a review of previous work in this area.</p>
+            <div class="section_2" id="sec2.1">
+                <h3>2.1 Nearest Neighbor Matching Algorithms</h3>
+                <p>We review the most widely used nearest neighbor techniques, classified in three categories: partitioning trees,
+ hashing techniques and neighboring graph techniques.</p>
+                <div class="section_2" id="sec2.1.1">
+                    <h4>2.1.1 Partitioning Trees</h4>
+                    <p>
+                        The kd-tree <a ref-type="bibr" anchor="ref9" id="context_ref_9_2.1.1" data-range="ref9" href="javascript:void()">[9]</a>
+                        <a ref-type="bibr" anchor="ref10" id="context_ref_10_2.1.1" data-range="ref10" href="javascript:void()">[10]</a>
+                        is one of the
+ best known nearest neighbor algorithms. While very effective in low dimensionality spaces, its performance quickly
+ decreases for high dimensional data.
+                    </p>
+                    <p class="has-inline-formula">
+                        Arya et al. <a ref-type="bibr" anchor="ref11" id="context_ref_11_2.1.1" data-range="ref11" href="javascript:void()">[11]</a>
+                        propose a variation of the k-d tree to be used for
+ approximate search by considering 
+                        <i>
+                            <inline-formula class="inline-formula">
+                                <tex-math>$(1+\varepsilon)$</tex-math>
+                            </inline-formula>
+                            -approximate
+                        </i>
+                        nearest
+ neighbors, points for which 
+                        <inline-formula class="inline-formula">
+                            <tex-math>$dist(p, q) \le (1 + \varepsilon)dist(p^\ast, q)$</tex-math>
+                        </inline-formula>
+                        where 
+
+                        <inline-formula class="inline-formula">
+                            <tex-math>$p^\ast$</tex-math>
+                        </inline-formula>
+                        is the true nearest neighbor. The authors also propose the use of a priority queue to
+ speed up the search. This method of approximating the nearest neighbor search is also referred to as “error
+ bound” approximate search.
+                    </p>
+                    <p>
+                        Another way of approximating the nearest neighbor search is by limiting the time spent during the search, or
+ “time bound” approximate search. This method is proposed in <a ref-type="bibr" anchor="ref12" id="context_ref_12_2.1.1" data-range="ref12" href="javascript:void()">[12]</a>
+                        where the k-d tree search is stopped early after examining a fixed number of leaf nodes. In practice the
+ time-constrained approximation criterion has been found to give better results than the error-constrained approximate
+ search.
+                    </p>
+                    <p>
+                        Multiple randomized k-d trees are proposed in <a ref-type="bibr" anchor="ref13" id="context_ref_13_2.1.1" data-range="ref13" href="javascript:void()">[13]</a>
+                        as a means to speed up
+ approximate nearest-neighbor search. In <a ref-type="bibr" anchor="ref14" id="context_ref_14_2.1.1" data-range="ref14" href="javascript:void()">[14]</a>
+                        we perform a wide range of
+ comparisons showing that the multiple randomized trees are one of the most effective methods for matching high
+ dimensional data.
+                    </p>
+                    <p>
+                        Variations of the k-d tree using non-axis-aligned partitioning hyperplanes have been proposed: the PCA-tree 
+<a ref-type="bibr" anchor="ref15" id="context_ref_15_2.1.1" data-range="ref15" href="javascript:void()">[15]</a>
+                        , the RP-tree <a ref-type="bibr" anchor="ref16" id="context_ref_16_2.1.1" data-range="ref16" href="javascript:void()">[16]</a>
+                        , and the
+ trinary projection tree <a ref-type="bibr" anchor="ref17" id="context_ref_17_2.1.1" data-range="ref17" href="javascript:void()">[17]</a>
+                        . We have not found such algorithms to be more
+ efficient than a randomized k-d tree decomposition, as the overhead of evaluating multiple dimensions during search
+ outweighed the benefit of the better space decomposition.
+                    </p>
+                    <p>
+                        Another class of partitioning trees decompose the space using various clustering algorithms instead of using
+ hyperplanes as in the case of the k-d tree and its variants. Example of such decompositions include the hierarchical
+ k-means tree <a ref-type="bibr" anchor="ref18" id="context_ref_18_2.1.1" data-range="ref18" href="javascript:void()">[18]</a>
+                        , the GNAT <a ref-type="bibr" anchor="ref19" id="context_ref_19_2.1.1" data-range="ref19" href="javascript:void()">[19]</a>
+                        ,
+ the anchors hierarchy <a ref-type="bibr" anchor="ref20" id="context_ref_20_2.1.1" data-range="ref20" href="javascript:void()">[20]</a>
+                        , the vp-tree <a ref-type="bibr" anchor="ref21" id="context_ref_21_2.1.1" data-range="ref21" href="javascript:void()">[21]</a>
+                        , the cover tree <a ref-type="bibr" anchor="ref22" id="context_ref_22_2.1.1" data-range="ref22" href="javascript:void()">[22]</a>
+                        and the spill-tree 
+<a ref-type="bibr" anchor="ref23" id="context_ref_23_2.1.1" data-range="ref23" href="javascript:void()">[23]</a>
+                        . Nister and Stewenius <a ref-type="bibr" anchor="ref24" id="context_ref_24_2.1.1" data-range="ref24" href="javascript:void()">[24]</a>
+                        propose the vocabulary tree, which is searched by accessing a single leaf of a hierarchical k-means tree. Leibe
+ et al. <a ref-type="bibr" anchor="ref25" id="context_ref_25_2.1.1" data-range="ref25" href="javascript:void()">[25]</a>
+                        propose a ball-tree data structure constructed using a mixed
+ partitional-agglomerative clustering algorithm. Schindler et al. <a ref-type="bibr" anchor="ref26" id="context_ref_26_2.1.1" data-range="ref26" href="javascript:void()">[26]</a>
+                        propose a new way of searching the hierarchical k-means tree. Philbin et al. <a ref-type="bibr" anchor="ref2" id="context_ref_2_2.1.1" data-range="ref2" href="javascript:void()">[2]
+</a>
+                        conducted experiments showing that an approximate flat vocabulary outperforms a vocabulary tree in a
+ recognition task. In this paper we describe a modified k-means tree algorithm that we have found to give the best
+ results for some data sets, while randomized k-d trees are best for others.
+                    </p>
+                    <p>
+                        Jégou et al. <a ref-type="bibr" anchor="ref27" id="context_ref_27_2.1.1" data-range="ref27" href="javascript:void()">[27]</a>
+                        propose the product quantization approach in
+ which they decompose the space into low dimensional subspaces and represent the data sets points by compact codes
+ computed as quantization indices in these subspaces. The compact codes are efficiently compared to the query points
+ using an asymmetric approximate distance. Babenko and Lempitsky <a ref-type="bibr" anchor="ref28" id="context_ref_28_2.1.1" data-range="ref28" href="javascript:void()">[28]</a>
+                        propose
+ the inverted multi-index, obtained by replacing the standard quantization in an inverted index with product
+ quantization, obtaining a denser subdivision of the search space. Both these methods are shown to be efficient at
+ searching large data sets and they should be considered for further evaluation and possible incorporation into FLANN.
+
+                    </p>
+                </div>
+                <div class="section_2" id="sec2.1.2">
+                    <h4>2.1.2 Hashing Based Nearest Neighbor Techniques</h4>
+                    <p>
+                        Perhaps the best known hashing based nearest neighbor technique is locality sensitive hashing (LSH) 
+<a ref-type="bibr" anchor="ref29" id="context_ref_29_2.1.2" data-range="ref29" href="javascript:void()">[29]</a>
+                        , which uses a large number of hash functions with the property that the
+ hashes of elements that are close to each other are also likely to be close. Variants of LSH such as multi-probe LSH 
+<a ref-type="bibr" anchor="ref30" id="context_ref_30_2.1.2" data-range="ref30" href="javascript:void()">[30]</a>
+                        improves the high storage costs by reducing the number of hash tables,
+ and LSH Forest <a ref-type="bibr" anchor="ref31" id="context_ref_31_2.1.2" data-range="ref31" href="javascript:void()">[31]</a>
+                        adapts better to the data without requiring hand tuning
+ of parameters.
+                    </p>
+                    <p>
+                        The performance of hashing methods is highly dependent on the quality of the hashing functions they use and a large
+ body of research has been targeted at improving hashing methods by using data-dependent hashing functions computed
+ using various learning techniques: parameter sensitive hashing <a ref-type="bibr" anchor="ref5" id="context_ref_5_2.1.2" data-range="ref5" href="javascript:void()">[5]</a>
+                        , spectral
+ hashing <a ref-type="bibr" anchor="ref32" id="context_ref_32_2.1.2" data-range="ref32" href="javascript:void()">[32]</a>
+                        , randomized LSH hashing from learned metrics 
+<a ref-type="bibr" anchor="ref33" id="context_ref_33_2.1.2" data-range="ref33" href="javascript:void()">[33]</a>
+                        , kernelized LSH <a ref-type="bibr" anchor="ref34" id="context_ref_34_2.1.2" data-range="ref34" href="javascript:void()">[34]</a>
+                        , learnt
+ binary embeddings <a ref-type="bibr" anchor="ref35" id="context_ref_35_2.1.2" data-range="ref35" href="javascript:void()">[35]</a>
+                        , shift-invariant kernel hashing 
+<a ref-type="bibr" anchor="ref36" id="context_ref_36_2.1.2" data-range="ref36" href="javascript:void()">[36]</a>
+                        , semi-supervised hashing <a ref-type="bibr" anchor="ref37" id="context_ref_37_2.1.2" data-range="ref37" href="javascript:void()">[37]</a>
+                        ,
+ optimized kernel hashing <a ref-type="bibr" anchor="ref38" id="context_ref_38_2.1.2" data-range="ref38" href="javascript:void()">[38]</a>
+                        and complementary hashing 
+<a ref-type="bibr" anchor="ref39" id="context_ref_39_2.1.2" data-range="ref39" href="javascript:void()">[39]</a>
+                        .
+                    </p>
+                    <p>
+                        The different LSH algorithms provide theoretical guarantees on the search quality and have been successfully used in
+ a number of projects, however our experiments reported in <a ref-type="sec" anchor="sec4" class="fulltext-link">Section 4</a>
+                        , show that
+ in practice they are usually outperformed by algorithms using space partitioning structures such as the randomized k-d
+ trees and the priority search k-means tree.
+                    </p>
+                </div>
+                <div class="section_2" id="sec2.1.3">
+                    <h4>2.1.3 Nearest Neighbor Graph Techniques</h4>
+                    <p>
+                        Nearest neighbor graph methods build a graph structure in which points are vertices and edges connect each point to
+ its nearest neighbors. The query points are used to explore this graph using various strategies in order to get closer
+ to their nearest neighbors. In <a ref-type="bibr" anchor="ref40" id="context_ref_40_2.1.3" data-range="ref40" href="javascript:void()">[40]</a>
+                        the authors select a few well separated
+ elements in the graph as “seeds” and start the graph exploration from those seeds in a best-first fashion.
+ Similarly, the authors of <a ref-type="bibr" anchor="ref41" id="context_ref_41_2.1.3" data-range="ref41" href="javascript:void()">[41]</a>
+                        perform a best-first exploration of the k-NN
+ graph, but use a hill-climbing strategy and pick the starting points at random. They present recent experiments that
+ compare favourably to randomized KD-trees, so the proposed algorithm should be considered for future evaluation and
+ possible incorporation into FLANN.
+                    </p>
+                    <p>
+                        The nearest neighbor graph methods suffer from a quite expensive construction of the k-NN graph structure. Wang
+ et al. <a ref-type="bibr" anchor="ref42" id="context_ref_42_2.1.3" data-range="ref42" href="javascript:void()">[42]</a>
+                        improve the construction cost by building an approximate
+ nearest neighbor graph.
+                    </p>
+                </div>
+            </div>
+            <div class="section_2" id="sec2.2">
+                <h3>2.2 Automatic Configuration of NN Algorithms</h3>
+                <p>There have been hundreds of papers published on nearest neighbor search algorithms, but there has been little
+ systematic comparison to guide the choice among algorithms and set their internal parameters. In practice, and in most
+ of the nearest neighbor literature, setting the algorithm parameters is a manual process carried out by using various
+ heuristics and rarely make use of more systematic approaches.</p>
+                <p>
+                    Bawa et al. <a ref-type="bibr" anchor="ref31" id="context_ref_31_2.2" data-range="ref31" href="javascript:void()">[31]</a>
+                    show that the performance of the standard LSH
+ algorithm is critically dependent on the length of the hashing key and propose the LSH Forest, a self-tuning algorithm
+ that eliminates this data dependent parameter.
+                </p>
+                <p>
+                    In a previous paper <a ref-type="bibr" anchor="ref14" id="context_ref_14_2.2" data-range="ref14" href="javascript:void()">[14]</a>
+                    we have proposed an automatic nearest neighbor
+ algorithm configuration method by combining grid search with a finer grained Nelder-Mead downhill simplex optimization
+ process <a ref-type="bibr" anchor="ref43" id="context_ref_43_2.2" data-range="ref43" href="javascript:void()">[43]</a>
+                    .
+                </p>
+                <p>
+                    There has been extensive research on <i>algorithm configuration</i>
+                    methods 
+<a ref-type="bibr" anchor="ref44" id="context_ref_44_2.2" data-range="ref44" href="javascript:void()">[44]</a>
+                    <a ref-type="bibr" anchor="ref45" id="context_ref_45_2.2" data-range="ref45" href="javascript:void()">[45]</a>
+                    , however we are not aware of
+ papers that apply such techniques to finding optimum parameters for nearest neighbor algorithms. Bergstra and Bengio 
+<a ref-type="bibr" anchor="ref46" id="context_ref_46_2.2" data-range="ref46" href="javascript:void()">[46]</a>
+                    show that, except for small parameter spaces, random search can be a more
+ efficient strategy for parameter optimization than grid search.
+                </p>
+            </div>
+        </div>
+        <div class="section" id="sec3">
+            <div class="header article-hdr">
+                <div class="kicker">SECTION 3</div>
+                <h2>Fast Approximate NN Matching</h2>
+            </div>
+            <p>Exact search is too costly for many applications, so this has generated interest in approximate nearest-neighbor
+ search algorithms which return non-optimal neighbors in some cases, but can be orders of magnitude faster than exact
+ search.</p>
+            <p>
+                After evaluating many different algorithms for approximate nearest neighbor search on data sets with a wide range of
+ dimensionality <a ref-type="bibr" anchor="ref14" id="context_ref_14_3" data-range="ref14" href="javascript:void()">[14]</a>
+                <a ref-type="bibr" anchor="ref47" id="context_ref_47_3" data-range="ref47" href="javascript:void()">[47]</a>
+                , we have
+ found that one of two algorithms gave the best performance: the <i>priority search k-means tree</i>
+                or
+ the <i>multiple randomized k-d trees</i>
+                . These algorithms are described in the remainder of this section.
+
+            </p>
+            <div class="section_2" id="sec3.1">
+                <h3>3.1 The Randomized k-d Tree Algorithm</h3>
+                <p class="has-inline-formula">
+                    The randomized k-d tree algorithm <a ref-type="bibr" anchor="ref13" id="context_ref_13_3.1" data-range="ref13" href="javascript:void()">[13]</a>
+                    , is an approximate nearest neighbor
+ search algorithm that builds multiple randomized k-d trees which are searched in parallel. The trees are built in a
+ similar manner to the classic k-d tree <a ref-type="bibr" anchor="ref9" id="context_ref_9_3.1" data-range="ref9" href="javascript:void()">[9]</a>
+                    <a ref-type="bibr" anchor="ref10" id="context_ref_10_3.1" data-range="ref10" href="javascript:void()">[10]</a>
+                    , with the difference that where the classic kd-tree algorithm splits data on the dimension with the highest
+ variance, for the randomized k-d trees the split dimension is chosen randomly from the top 
+                    <inline-formula class="inline-formula">
+                        <tex-math>$N_D$</tex-math>
+                    </inline-formula>
+                    dimensions with the highest variance. We used the fixed value 
+                    <inline-formula class="inline-formula">
+                        <tex-math>$N_D=5$
+</tex-math>
+                    </inline-formula>
+                    in our
+ implementation, as this performs well across all our data sets and does not benefit significantly from further tuning.
+
+                </p>
+                <p>When searching the randomized k-d forest, a single priority queue is maintained across all the randomized trees. The
+ priority queue is ordered by increasing distance to the decision boundary of each branch in the queue, so the search
+ will explore first the closest leaves from all the trees. Once a data point has been examined (compared to the query
+ point) inside a tree, it is marked in order to not be re-examined in another tree. The degree of approximation is
+ determined by the maximum number of leaves to be visited (across all trees), returning the best nearest neighbor
+ candidates found up to that point.</p>
+                <p>
+                    <a ref-type="fig" anchor="fig1" class="fulltext-link">Fig. 1</a>
+                    shows the value of searching in many randomized kd-trees at the same
+ time. It can be seen that the performance improves with the number of randomized trees up to a certain point (about 20
+ random trees in this case) and that increasing the number of random trees further leads to static or decreasing
+ performance. The memory overhead of using multiple random trees increases linearly with the number of trees, so at
+ some point the speedup may not justify the additional memory used.
+
+                </p>
+                <div class="figure figure-full" id="fig1">
+                    <!--
+          Workaround for combined images.Eg.- 1000116 Fig. 5
+        -->
+                    <div class="img-wrap">
+                        <a href="/mediastore/IEEE/content/media/34/6914638/6809191/muja1-2321376-large.gif" data-fig-id="fig1">
+                            <img src="/mediastore/IEEE/content/media/34/6914638/6809191/muja1-2321376-small.gif" loading="lazy" alt="Fig. 1. - Speedup obtained by using multiple randomized kd-trees (100K SIFT features data set)."/>
+                        </a>
+                        <div class="zoom-container">
+                            <button class="zoom" title="View Larger Image" aria-label="View Larger Image" data-fig-id="fig1"/>
+                        </div>
+                    </div>
+                    <div class="figcaption">
+                        <b class="title">Fig. 1. </b>
+                        <fig>
+                            <p>Speedup obtained by using multiple randomized kd-trees (100K SIFT features data set).</p>
+                        </fig>
+                    </div>
+                    <p class="links">
+                        <button ref-type="fig-link" data-docId="6809191" class="all">Show All</button>
+                    </p>
+                </div>
+                <p>
+                    <a ref-type="fig" anchor="fig2" class="fulltext-link">Fig. 2</a>
+                    gives an intuition behind why exploring multiple randomized kd-tree
+ improves the search performance. When the query point is close to one of the splitting hyperplanes, its nearest
+ neighbor lies with almost equal probability on either side of the hyperplane and if it lies on the opposite side of
+ the splitting hyperplane, further exploration of the tree is required before the cell containing it will be
+ visited. Using multiple random decompositions increases the probability that in one of them the query point and its
+ nearest neighbor will be in the same cell.
+
+                </p>
+                <div class="figure figure-full" id="fig2">
+                    <!--
+          Workaround for combined images.Eg.- 1000116 Fig. 5
+        -->
+                    <div class="img-wrap">
+                        <a href="/mediastore/IEEE/content/media/34/6914638/6809191/muja2-2321376-large.gif" data-fig-id="fig2">
+                            <img src="/mediastore/IEEE/content/media/34/6914638/6809191/muja2-2321376-small.gif" loading="lazy" alt="Fig. 2. - Example of randomized kd-trees. The nearest neighbor is across a decision boundary from the query point in&#10; the first decomposition, however is in the same cell in the second decomposition."/>
+                        </a>
+                        <div class="zoom-container">
+                            <button class="zoom" title="View Larger Image" aria-label="View Larger Image" data-fig-id="fig2"/>
+                        </div>
+                    </div>
+                    <div class="figcaption">
+                        <b class="title">Fig. 2. </b>
+                        <fig>
+                            <p>Example of randomized kd-trees. The nearest neighbor is across a decision boundary from the query point in
+ the first decomposition, however is in the same cell in the second decomposition.</p>
+                        </fig>
+                    </div>
+                    <p class="links">
+                        <button ref-type="fig-link" data-docId="6809191" class="all">Show All</button>
+                    </p>
+                </div>
+            </div>
+            <div class="section_2" id="sec3.2">
+                <h3>3.2 The Priority Search K-Means Tree Algorithm</h3>
+                <p>
+                    We have found the randomized k-d forest to be very effective in many situations, however on other data sets a
+ different algorithm, the <i>priority search k-means tree</i>
+                    , has been more effective at finding approximate
+ nearest neighbors, especially when a high precision is required. The priority search k-means tree tries to better
+ exploit the natural structure existing in the data, by clustering the data points using the full distance across all
+ dimensions, in contrast to the (randomized) k-d tree algorithm which only partitions the data based on one dimension
+ at a time.
+                </p>
+                <p>
+                    Nearest-neighbor algorithms that use hierarchical partitioning schemes based on clustering the data points have been
+ previously proposed in the literature <a ref-type="bibr" anchor="ref18" id="context_ref_18_3.2" data-range="ref18" href="javascript:void()">[18]</a>
+                    <a ref-type="bibr" anchor="ref19" id="context_ref_19_3.2" data-range="ref19" href="javascript:void()">[19]</a>
+                    <a ref-type="bibr" anchor="ref24" id="context_ref_24_3.2" data-range="ref24" href="javascript:void()">[24]</a>
+                    . These algorithms differ in the way they construct the
+ partitioning tree (whether using k-means, agglomerative or some other form of clustering) and especially in the
+ strategies used for exploring the hierarchical tree. We have developed an improved version that explores the k-means
+ tree using a <i>best-bin-first</i>
+                    strategy, by analogy to what has been found to significantly improve the
+ performance of the approximate kd-tree searches.
+                </p>
+                <div class="section_2" id="sec3.2.1">
+                    <h4>3.2.1 Algorithm Description</h4>
+                    <p class="has-inline-formula">
+                        The priority search k-means tree is constructed by partitioning the data points at each level into 
+                        <inline-formula class="inline-formula">
+                            <tex-math>$K$</tex-math>
+                        </inline-formula>
+                        distinct regions using k-means clustering, and then applying the same method recursively to the
+ points in each region. The recursion is stopped when the number of points in a region is smaller than 
+                        <inline-formula class="inline-formula">
+                            <tex-math>$K$</tex-math>
+                        </inline-formula>
+                        (see Algorithm 1).
+
+                    </p>
+                    <div class="figure figure-full" id="x1">
+                        <!--
+          Workaround for combined images.Eg.- 1000116 Fig. 5
+        -->
+                        <div class="img-wrap">
+                            <a href="/mediastore/IEEE/content/media/34/6914638/6809191/muja.x1-2321376-large.gif" data-fig-id="x1">
+                                <img src="/mediastore/IEEE/content/media/34/6914638/6809191/muja.x1-2321376-small.gif" loading="lazy" alt=" - "/>
+                            </a>
+                            <div class="zoom-container">
+                                <button class="zoom" title="View Larger Image" aria-label="View Larger Image" data-fig-id="x1"/>
+                            </div>
+                        </div>
+                        <div class="figcaption">
+                            <b class="title"></b>
+                            <fig/>
+                        </div>
+                        <p class="links">
+                            <button ref-type="fig-link" data-docId="6809191" class="all">Show All</button>
+                        </p>
+                    </div>
+                    <p>The tree is searched by initially traversing the tree from the root to the closest leaf, following at each inner
+ node the branch with the closest cluster centre to the query point, and adding all unexplored branches along the path
+ to a priority queue (see Algorithm 2). The priority queue is sorted in increasing distance from the query point to the
+ boundary of the branch being added to the queue. After the initial tree traversal, the algorithm resumes traversing
+ the tree, always starting with the top branch in the queue.
+</p>
+                    <div class="figure figure-full" id="x2">
+                        <!--
+          Workaround for combined images.Eg.- 1000116 Fig. 5
+        -->
+                        <div class="img-wrap">
+                            <a href="/mediastore/IEEE/content/media/34/6914638/6809191/muja.x2-2321376-large.gif" data-fig-id="x2">
+                                <img src="/mediastore/IEEE/content/media/34/6914638/6809191/muja.x2-2321376-small.gif" loading="lazy" alt=" - "/>
+                            </a>
+                            <div class="zoom-container">
+                                <button class="zoom" title="View Larger Image" aria-label="View Larger Image" data-fig-id="x2"/>
+                            </div>
+                        </div>
+                        <div class="figcaption">
+                            <b class="title"></b>
+                            <fig/>
+                        </div>
+                        <p class="links">
+                            <button ref-type="fig-link" data-docId="6809191" class="all">Show All</button>
+                        </p>
+                    </div>
+                    <p class="has-inline-formula">
+                        The number of clusters 
+                        <inline-formula class="inline-formula">
+                            <tex-math>$K$</tex-math>
+                        </inline-formula>
+                        to use when partitioning the data
+ at each node is a parameter of the algorithm, called the <i>branching factor</i>
+                        and choosing 
+
+                        <inline-formula class="inline-formula">
+                            <tex-math>$K$</tex-math>
+                        </inline-formula>
+                        is important for obtaining good search performance. In 
+<a ref-type="sec" anchor="sec3.4" class="fulltext-link">Section 3.4</a>
+                        we propose an algorithm for finding the optimum algorithm
+ parameters, including the optimum branching factor. <a ref-type="fig" anchor="fig3" class="fulltext-link">Fig. 3</a>
+                        contains a
+ visualisation of several hierarchical k-means decompositions with different branching factors.
+
+                    </p>
+                    <div class="figure figure-full" id="fig3">
+                        <!--
+          Workaround for combined images.Eg.- 1000116 Fig. 5
+        -->
+                        <div class="img-wrap">
+                            <a href="/mediastore/IEEE/content/media/34/6914638/6809191/muja3-2321376-large.gif" data-fig-id="fig3">
+                                <img src="/mediastore/IEEE/content/media/34/6914638/6809191/muja3-2321376-small.gif" loading="lazy" alt="Fig. 3. - Projections of priority search k-means trees constructed using different branching factors: 4, 32, 128. The&#10; projections are constructed using the same technique as in [26], gray values&#10; indicating the ratio between the distances to the nearest and the second-nearest cluster centre at each tree level, so&#10; that the darkest values (ratio $\approx$&#10; 1) fall near the boundaries&#10; between k-means regions."/>
+                            </a>
+                            <div class="zoom-container">
+                                <button class="zoom" title="View Larger Image" aria-label="View Larger Image" data-fig-id="fig3"/>
+                            </div>
+                        </div>
+                        <div class="figcaption">
+                            <b class="title">Fig. 3. </b>
+                            <fig>
+                                <p class="has-inline-formula">
+                                    Projections of priority search k-means trees constructed using different branching factors: 4, 32, 128. The
+ projections are constructed using the same technique as in <a ref-type="bibr" anchor="ref26" id="context_ref_26_3.2.1" data-range="ref26" href="javascript:void()">[26]</a>
+                                    , gray values
+ indicating the ratio between the distances to the nearest and the second-nearest cluster centre at each tree level, so
+ that the darkest values (ratio 
+                                    <inline-formula class="inline-formula">
+                                        <tex-math>$\approx$</tex-math>
+                                    </inline-formula>
+                                    1) fall near the boundaries
+ between k-means regions.
+                                </p>
+                            </fig>
+                        </div>
+                        <p class="links">
+                            <button ref-type="fig-link" data-docId="6809191" class="all">Show All</button>
+                        </p>
+                    </div>
+                    <p class="has-inline-formula">
+                        Another parameter of the priority search k-means tree is 
+                        <inline-formula class="inline-formula">
+                            <tex-math>$I_{max}$</tex-math>
+                        </inline-formula>
+                        , the <i>maximum number of iterations</i>
+                        to perform in the k-means clustering loop. Performing fewer iterations can
+ substantially reduce the tree build time and results in a slightly less than optimal clustering (if we consider the
+ sum of squared errors from the points to the cluster centres as the measure of optimality). However, we have observed
+ that even when using a small number of iterations, the nearest neighbor search performance is similar to that of the
+ tree constructed by running the clustering until convergence, as illustrated by <a ref-type="fig" anchor="fig4" class="fulltext-link">Fig. 4
+</a>
+                        . It can be seen that using as few as seven iterations we get more than 90 percent of the nearest-neighbor
+ performance of the tree constructed using full convergence, but requiring less than 10 percent of the build time.
+
+                    </p>
+                    <div class="figure figure-full" id="fig4">
+                        <!--
+          Workaround for combined images.Eg.- 1000116 Fig. 5
+        -->
+                        <div class="img-wrap">
+                            <a href="/mediastore/IEEE/content/media/34/6914638/6809191/muja4-2321376-large.gif" data-fig-id="fig4">
+                                <img src="/mediastore/IEEE/content/media/34/6914638/6809191/muja4-2321376-small.gif" loading="lazy" alt="Fig. 4. - The influence that the number of k-means iterations has on the search speed of the k-means tree. Figure&#10; shows the relative search time compared to the case of using full convergence."/>
+                            </a>
+                            <div class="zoom-container">
+                                <button class="zoom" title="View Larger Image" aria-label="View Larger Image" data-fig-id="fig4"/>
+                            </div>
+                        </div>
+                        <div class="figcaption">
+                            <b class="title">Fig. 4. </b>
+                            <fig>
+                                <p>The influence that the number of k-means iterations has on the search speed of the k-means tree. Figure
+ shows the relative search time compared to the case of using full convergence.</p>
+                            </fig>
+                        </div>
+                        <p class="links">
+                            <button ref-type="fig-link" data-docId="6809191" class="all">Show All</button>
+                        </p>
+                    </div>
+                    <p class="has-inline-formula">
+                        The algorithm to use when picking the initial centres in the k-means clustering can be controlled by the 
+
+                        <inline-formula class="inline-formula">
+                            <tex-math>$C_{alg}$</tex-math>
+                        </inline-formula>
+                        parameter. In our experiments (and in the FLANN library) we have used the following
+ algorithms: random selection, Gonzales’ algorithm (selecting the centres to be spaced apart from each other) and
+ KMeans++ algorithm <a ref-type="bibr" anchor="ref48" id="context_ref_48_3.2.1" data-range="ref48" href="javascript:void()">[48]</a>
+                        . We have found that the initial cluster selection
+ made only a small difference in terms of the overall search efficiency in most cases and that the random initial
+ cluster selection is usually a good choice for the priority search k-means tree.
+                    </p>
+                </div>
+                <div class="section_2" id="sec3.2.2">
+                    <h4>3.2.2 Analysis</h4>
+                    <p>When analysing the complexity of the priority search k-means tree, we consider the tree construction time, search
+ time and the memory requirements for storing the tree.</p>
+                    <p class="has-inline-formula">
+                        <i>Construction time complexity</i>
+                        . During the construction of the k-means tree, a k-means clustering
+ operation has to be performed for each inner node. Considering a node 
+                        <inline-formula class="inline-formula">
+                            <tex-math>$v$</tex-math>
+                        </inline-formula>
+                        with 
+
+                        <inline-formula class="inline-formula">
+                            <tex-math>$n_v$</tex-math>
+                        </inline-formula>
+                        associated data points, and assuming a maximum number of iterations 
+                        <inline-formula class="inline-formula">
+                            <tex-math>$I$</tex-math>
+                        </inline-formula>
+                        in the k-means clustering loop, the complexity of the clustering operation is 
+                        <inline-formula class="inline-formula">
+                            <tex-math>$O(n_v d K I)$</tex-math>
+                        </inline-formula>
+                        , where 
+                        <inline-formula class="inline-formula">
+                            <tex-math>$d$</tex-math>
+                        </inline-formula>
+                        represents the data
+ dimensionality. Taking into account all the inner nodes on a level, we have 
+                        <inline-formula class="inline-formula">
+                            <tex-math>$\sum n_v = n$
+</tex-math>
+                        </inline-formula>
+                        , so the
+ complexity of constructing a level in the tree is 
+                        <inline-formula class="inline-formula">
+                            <tex-math>$O(n d K I)$</tex-math>
+                        </inline-formula>
+                        . Assuming a balanced tree, the
+ height of the tree will be 
+                        <inline-formula class="inline-formula">
+                            <tex-math>$(\log\; n / \log\; K)$</tex-math>
+                        </inline-formula>
+                        , resulting in a total tree
+ construction cost of 
+                        <inline-formula class="inline-formula">
+                            <tex-math>$O(ndKI (\log\; n / \log\; K))$</tex-math>
+                        </inline-formula>
+                        .
+                    </p>
+                    <p class="has-inline-formula">
+                        <i>Search time complexity</i>
+                        . In case of the time constrained approximate nearest neighbor search, the
+ algorithm stops after examining 
+                        <inline-formula class="inline-formula">
+                            <tex-math>$L$</tex-math>
+                        </inline-formula>
+                        data points. Considering a
+ complete priority search k-means tree with branching factor 
+                        <inline-formula class="inline-formula">
+                            <tex-math>$K$</tex-math>
+                        </inline-formula>
+                        , the number of top down tree
+ traversals required is 
+                        <inline-formula class="inline-formula">
+                            <tex-math>$L/K$</tex-math>
+                        </inline-formula>
+                        (each leaf node contains 
+
+                        <inline-formula class="inline-formula">
+                            <tex-math>$K$</tex-math>
+                        </inline-formula>
+                        points in a complete k-means tree). During each top-down traversal, the algorithm
+ needs to check 
+                        <inline-formula class="inline-formula">
+                            <tex-math>$O(\log\; n / \log\; K)$</tex-math>
+                        </inline-formula>
+                        inner nodes and one leaf node.
+                    </p>
+                    <p class="has-inline-formula">
+                        For each internal node, the algorithm has to find the branch closest to the query point, so it needs to compute the
+ distances to all the cluster centres of the child nodes, an 
+                        <inline-formula class="inline-formula">
+                            <tex-math>$O(Kd)$</tex-math>
+                        </inline-formula>
+                        operation. The unexplored
+ branches are added to a priority queue, which can be accomplished in 
+                        <inline-formula class="inline-formula">
+                            <tex-math>$O(K)$</tex-math>
+                        </inline-formula>
+                        amortized cost when
+ using binomial heaps. For the leaf node the distance between the query and all the points in the leaf needs to be
+ computed which takes 
+                        <inline-formula class="inline-formula">
+                            <tex-math>$O(Kd)$</tex-math>
+                        </inline-formula>
+                        time. In summary the overall
+ search cost is 
+                        <inline-formula class="inline-formula">
+                            <tex-math>$O(Ld (\log\; n / \log\; K))$</tex-math>
+                        </inline-formula>
+                        .
+                    </p>
+                </div>
+            </div>
+            <div class="section_2" id="sec3.3">
+                <h3>3.3 The Hierarchical Clustering Tree</h3>
+                <p>
+                    Matching binary features is of increasing interest in the computer vision community with many binary visual
+ descriptors being recently proposed: BRIEF <a ref-type="bibr" anchor="ref49" id="context_ref_49_3.3" data-range="ref49" href="javascript:void()">[49]</a>
+                    , ORB 
+<a ref-type="bibr" anchor="ref50" id="context_ref_50_3.3" data-range="ref50" href="javascript:void()">[50]</a>
+                    , BRISK <a ref-type="bibr" anchor="ref51" id="context_ref_51_3.3" data-range="ref51" href="javascript:void()">[51]</a>
+                    . Many algorithms
+ suitable for matching vector based features, such as the randomized kd-tree and priority search k-means tree, are
+ either not efficient or not suitable for matching binary features (for example, the priority search k-means tree
+ requires the points to be in a vector space where their dimensions can be independently averaged).
+                </p>
+                <p>
+                    Binary descriptors are typically compared using the Hamming distance, which for binary data can be computed as a
+ bitwise XOR operation followed by a bit count on the result (very efficient on computers with hardware support for
+ counting the number of bits set in a word<a ref-type="fn" anchor="fn1" class="footnote-link"/>).
+                </p>
+                <p>
+                    This section briefly presents a new data structure and algorithm, called the <i>hierarchical clustering tree
+</i>
+                    , which we found to be very effective at matching binary features. For a more detailed description of this
+ algorithm the reader is encouraged to consult <a ref-type="bibr" anchor="ref47" id="context_ref_47_3.3" data-range="ref47" href="javascript:void()">[47]</a>
+                    and 
+<a ref-type="bibr" anchor="ref52" id="context_ref_52_3.3" data-range="ref52" href="javascript:void()">[52]</a>
+                    .
+                </p>
+                <p>The hierarchical clustering tree performs a decomposition of the search space by recursively clustering the input
+ data set using random data points as the cluster centers of the non-leaf nodes (see Algorithm 3).
+</p>
+                <div class="figure figure-full" id="x3">
+                    <!--
+          Workaround for combined images.Eg.- 1000116 Fig. 5
+        -->
+                    <div class="img-wrap">
+                        <a href="/mediastore/IEEE/content/media/34/6914638/6809191/muja.x3-2321376-large.gif" data-fig-id="x3">
+                            <img src="/mediastore/IEEE/content/media/34/6914638/6809191/muja.x3-2321376-small.gif" loading="lazy" alt=" - "/>
+                        </a>
+                        <div class="zoom-container">
+                            <button class="zoom" title="View Larger Image" aria-label="View Larger Image" data-fig-id="x3"/>
+                        </div>
+                    </div>
+                    <div class="figcaption">
+                        <b class="title"></b>
+                        <fig/>
+                    </div>
+                    <p class="links">
+                        <button ref-type="fig-link" data-docId="6809191" class="all">Show All</button>
+                    </p>
+                </div>
+                <p>
+                    In contrast to the priority search k-means tree presented above, for which using more than one tree did not bring
+ significant improvements, we have found that building multiple hierarchical clustering trees and searching them in
+ parallel using a common priority queue (the same approach that has been found to work well for randomized kd-trees 
+<a ref-type="bibr" anchor="ref13" id="context_ref_13_3.3" data-range="ref13" href="javascript:void()">[13]</a>
+                    ) resulted in significant improvements in the search performance.
+                </p>
+            </div>
+            <div class="section_2" id="sec3.4">
+                <h3>3.4 Automatic Selection of the Optimal Algorithm</h3>
+                <p>Our experiments have revealed that the optimal algorithm for approximate nearest neighbor search is highly dependent
+ on several factors such as the data dimensionality, size and structure of the data set (whether there is any
+ correlation between the features in the data set) and the desired search precision. Additionally, each algorithm has a
+ set of parameters that have significant influence on the search performance (e.g., number of randomized trees,
+ branching factor, number of k-means iterations).</p>
+                <p>
+                    As we already mention in <a ref-type="sec" anchor="sec2.2" class="fulltext-link">Section 2.2</a>
+                    , the optimum parameters for a nearest
+ neighbor algorithm are typically chosen manually, using various heuristics. In this section we propose a method for
+ automatic selection of the best nearest neighbor algorithm to use for a particular data set and for choosing its
+ optimum parameters.
+                </p>
+                <p class="has-inline-formula">
+                    By considering the nearest neighbor algorithm itself as a parameter of a generic nearest neighbor search routine 
+
+                    <inline-formula class="inline-formula">
+                        <tex-math>$A$</tex-math>
+                    </inline-formula>
+                    , the problem is reduced to determining the parameters 
+                    <inline-formula class="inline-formula">
+                        <tex-math>$\theta \in \Theta$</tex-math>
+                    </inline-formula>
+                    that give the best solution, where 
+                    <inline-formula class="inline-formula">
+                        <tex-math>$\Theta$</tex-math>
+                    </inline-formula>
+                    is also known as the <i>parameter configuration space</i>
+                    . This can be formulated as an optimization problem in the parameter
+ configuration space:
+                    <disp-formula id="deqn9" class="display-formula">
+                        <tex-math notation="">$$
+\mathop{\rm min}_{\theta \in \Theta }c(\theta)
+$$</tex-math>
+                        <span class="formula">
+                            <span class="link">View Source</span>
+                            <img aria-describedby="qtip-0" style="display:inline;" title="Right-click on figure or equation for MathML and additional features." data-hasqtip="0" class="qtooltip moreInfo" alt="Right-click on figure for MathML and additional features." src="/assets/img/icon.support.gif" border="0" height="20" width="24"/>
+                            <span class="tex tex2jax_ignore" style="display:none;">\mathop{\rm min}_{\theta \in \Theta }c(\theta)
+</span>
+                        </span>
+                    </disp-formula>
+                    with 
+
+                    <inline-formula class="inline-formula">
+                        <tex-math>$c : \Theta \rightarrow {\bb R}$</tex-math>
+                    </inline-formula>
+                    being a cost function indicating
+ how well the search algorithm 
+                    <inline-formula class="inline-formula">
+                        <tex-math>$A$</tex-math>
+                    </inline-formula>
+                    , configured with the parameters 
+
+                    <inline-formula class="inline-formula">
+                        <tex-math>$\theta$</tex-math>
+                    </inline-formula>
+                    , performs on the given input data.
+                </p>
+                <p class="has-inline-formula">
+                    We define the cost as a combination of the search time, tree build time, and tree memory overhead. Depending on the
+ application, each of these three factors can have a different importance: in some cases we don’t care much about
+ the tree build time (if we will build the tree only once and use it for a large number of queries), while in other
+ cases both the tree build time and search time must be small (if the tree is built on-line and searched a small number
+ of times). There are also situations when we wish to limit the memory overhead if we work in memory constrained
+ environments. We define the cost function as follows:
+                    <disp-formula id="deqn1" class="display-formula">
+                        <tex-math notation="">$$
+c(\theta) = {{ s(\theta)+w_b b(\theta)\over {\rm min}_{\theta \in \Theta }(s(\theta)+w_b b(\theta))} +w_m m(\theta)},
+ \eqno{\hbox{(1)}}
+$$</tex-math>
+                        <span class="formula">
+                            <span class="link">View Source</span>
+                            <img aria-describedby="qtip-0" style="display:inline;" title="Right-click on figure or equation for MathML and additional features." data-hasqtip="0" class="qtooltip moreInfo" alt="Right-click on figure for MathML and additional features." src="/assets/img/icon.support.gif" border="0" height="20" width="24"/>
+                            <span class="tex tex2jax_ignore" style="display:none;">c(\theta) = {{ s(\theta)+w_b b(\theta)\over {\rm min}_{\theta \in \Theta }(s(\theta)+w_b b(\theta))} +w_m m(\theta)},
+ \eqno{\hbox{(1)}}
+</span>
+                        </span>
+                    </disp-formula>
+                    where 
+
+                    <inline-formula class="inline-formula">
+                        <tex-math>$s(\theta)$</tex-math>
+                    </inline-formula>
+                    , 
+                    <inline-formula class="inline-formula">
+                        <tex-math>$b(\theta)$</tex-math>
+                    </inline-formula>
+                    and 
+                    <inline-formula class="inline-formula">
+                        <tex-math>$m(\theta)$</tex-math>
+                    </inline-formula>
+                    represent the search time, tree build time and memory overhead for the tree(s) constructed and
+ queried with parameters 
+                    <inline-formula class="inline-formula">
+                        <tex-math>$\theta$</tex-math>
+                    </inline-formula>
+                    . The memory overhead is measured
+ as the ratio of the memory used by the tree(s) and the memory used by the data: 
+                    <inline-formula class="inline-formula">
+                        <tex-math>$m(\theta) =
+ m_t(\theta)/m_d$</tex-math>
+                    </inline-formula>
+                    .
+                </p>
+                <p class="has-inline-formula">
+                    The weights 
+                    <inline-formula class="inline-formula">
+                        <tex-math>$w_b$</tex-math>
+                    </inline-formula>
+                    and 
+                    <inline-formula class="inline-formula">
+                        <tex-math>$w_m$</tex-math>
+                    </inline-formula>
+                    are
+ used to control the relative importance of the build time and memory overhead in the overall cost. The build-time
+ weight (
+                    <inline-formula class="inline-formula">
+                        <tex-math>$w_b$</tex-math>
+                    </inline-formula>
+                    ) controls the importance of the tree build time relative to the search time. Search
+ time is defined as the time to search for the same number of points as there are in the tree. The time overhead is
+ computed relative to the optimum time cost 
+                    <inline-formula class="inline-formula">
+                        <tex-math>${\rm min}_{\theta \in \Theta }(s(\theta)+w_b
+ b(\theta))$</tex-math>
+                    </inline-formula>
+                    , which is defined as the optimal search and build time if memory usage were not a factor.
+                </p>
+                <p>
+                    We perform the above optimization in two steps: a global exploration of the parameter space using grid search,
+ followed by a local optimization starting with the best solution found in the first step. The grid search is a
+ feasible and effective approach in the first step because the number of parameters is relatively low. In the second
+ step we use the Nelder-Mead downhill simplex method <a ref-type="bibr" anchor="ref43" id="context_ref_43_3.4" data-range="ref43" href="javascript:void()">[43]</a>
+                    to further locally
+ explore the parameter space and fine-tune the best solution obtained in the first step. Although this does not
+ guarantee a global minimum, our experiments have shown that the parameter values obtained are close to optimum in
+ practice.
+                </p>
+                <p>We use random sub-sampling cross-validation to generate the data and the query points when we run the optimization.
+ In FLANN the optimization can be run on the full data set for the most accurate results or using just a fraction of
+ the data set to have a faster auto-tuning process. The parameter selection needs to only be performed once for each
+ type of data set, and the optimum parameter values can be saved and applied to all future data sets of the same type.
+</p>
+            </div>
+        </div>
+        <div class="section" id="sec4">
+            <div class="header article-hdr">
+                <div class="kicker">SECTION 4</div>
+                <h2>Experiments</h2>
+            </div>
+            <p>
+                For the experiments presented in this section we used a selection of data sets with a wide range of sizes and data
+ dimensionality. Among the data sets used are the Winder/Brown patch data set <a ref-type="bibr" anchor="ref53" id="context_ref_53_4" data-range="ref53" href="javascript:void()">[53]
+</a>
+                , data sets of randomly sampled data of different dimensionality, data sets of SIFT features of different sizes
+ obtained by sampling from the CD cover data set of <a ref-type="bibr" anchor="ref24" id="context_ref_24_4" data-range="ref24" href="javascript:void()">[24]</a>
+                as well as a data set
+ of SIFT features extracted from the overlapping images forming panoramas.
+            </p>
+            <p>
+                We measure the accuracy of an approximate nearest neighbor algorithm using the <i>search precision</i>
+                (or
+ just <i>precision</i>
+                ), defined as the fraction of the neighbors returned by the approximate algorithm which
+ are exact nearest neighbors. We measure the search performance of an algorithm as the time required to perform a
+ linear search divided by the time required to perform the approximate search and we refer to it as the <i>search
+ speedup</i>
+                or just <i>speedup</i>
+                .
+            </p>
+            <div class="section_2" id="sec4.1">
+                <h3>4.1 Fast Approximate Nearest Neighbor Search</h3>
+                <p>
+                    We present several experiments we have conducted in order to analyse the performance of the two algorithms described
+ in <a ref-type="sec" anchor="sec3" class="fulltext-link">Section 3</a>
+                    .
+                </p>
+                <div class="section_2" id="sec4.1.1">
+                    <h4>4.1.1 Data Dimensionality</h4>
+                    <p class="has-inline-formula">
+                        Data dimensionality is one of the factors that has a great impact on the nearest neighbor matching performance. The
+ top of <a ref-type="fig" anchor="fig5" class="fulltext-link">Fig. 5</a>
+                        shows how the search performance degrades as the dimensionality
+ increases in the case of random vectors. The data sets in this case each contain 
+                        <inline-formula class="inline-formula">
+                            <tex-math>$10^5$
+</tex-math>
+                        </inline-formula>
+                        vectors
+ whose values are randomly sampled from the same uniform distribution. These random data sets are one of the most
+ difficult problems for nearest neighbor search, as no value gives any predictive information about any other value.
+
+                    </p>
+                    <div class="figure figure-full" id="fig5">
+                        <!--
+          Workaround for combined images.Eg.- 1000116 Fig. 5
+        -->
+                        <div class="img-wrap">
+                            <a href="/mediastore/IEEE/content/media/34/6914638/6809191/muja5-2321376-large.gif" data-fig-id="fig5">
+                                <img src="/mediastore/IEEE/content/media/34/6914638/6809191/muja5-2321376-small.gif" loading="lazy" alt="Fig. 5. - Search efficiency for data of varying dimensionality. We experimented on both random vectors and image&#10; patches, with data sets of size 100K. The random vectors (top figure) represent the hardest case in which dimensions&#10; have no correlations, while most real-world problems behave more like the image patches (bottom figure)."/>
+                            </a>
+                            <div class="zoom-container">
+                                <button class="zoom" title="View Larger Image" aria-label="View Larger Image" data-fig-id="fig5"/>
+                            </div>
+                        </div>
+                        <div class="figcaption">
+                            <b class="title">Fig. 5. </b>
+                            <fig>
+                                <p>Search efficiency for data of varying dimensionality. We experimented on both random vectors and image
+ patches, with data sets of size 100K. The random vectors (top figure) represent the hardest case in which dimensions
+ have no correlations, while most real-world problems behave more like the image patches (bottom figure).</p>
+                            </fig>
+                        </div>
+                        <p class="links">
+                            <button ref-type="fig-link" data-docId="6809191" class="all">Show All</button>
+                        </p>
+                    </div>
+                    <p>
+                        As can be seen in the top part of <a ref-type="fig" anchor="fig5" class="fulltext-link">Fig. 5</a>
+                        , the nearest-neighbor searches have
+ a low efficiency for higher dimensional data (for 68 percent precision the approximate search speed is no better than
+ linear search when the number of dimensions is greater than 800).
+                    </p>
+                    <p class="has-inline-formula">
+                        The performance is markedly different for many real-world data sets. The bottom part of 
+<a ref-type="fig" anchor="fig5" class="fulltext-link">Fig. 5</a>
+                        shows the speedup as a function of dimensionality for the Winder/Brown
+ image patches<a ref-type="fn" anchor="fn2" class="footnote-link"/>
+                        resampled to achieve varying dimensionality. In this case however, the speedup does not
+ decrease with dimensionality, it’s actually increasing for some precisions. This can be explained by the fact
+ that there exists a strong correlation between the dimensions, so that even for 
+                        <inline-formula class="inline-formula">
+                            <tex-math>$64\times
+ 64$</tex-math>
+                        </inline-formula>
+                        patches (4,096 dimensions), the similarity between only a few dimensions provides strong evidence for overall patch
+ similarity.
+                    </p>
+                    <p>
+                        <a ref-type="fig" anchor="fig6" class="fulltext-link">Fig. 6</a>
+                        shows four examples of queries on the Trevi data set of patches for
+ different patch sizes.
+
+                    </p>
+                    <div class="figure figure-full" id="fig6">
+                        <!--
+          Workaround for combined images.Eg.- 1000116 Fig. 5
+        -->
+                        <div class="img-wrap">
+                            <a href="/mediastore/IEEE/content/media/34/6914638/6809191/muja6-2321376-large.gif" data-fig-id="fig6">
+                                <img src="/mediastore/IEEE/content/media/34/6914638/6809191/muja6-2321376-small.gif" loading="lazy" alt="Fig. 6. - Example of nearest neighbor queries with different patch sizes. The Trevi Fountain patch data set was&#10; queried using different patch sizes. The rows are arranged in decreasing order by patch size. The query patch is on&#10; the left of each panel, while the following five patches are the nearest neighbors from a set of 100,000 patches.&#10; Incorrect matches with respect to ground truth are shown with an X."/>
+                            </a>
+                            <div class="zoom-container">
+                                <button class="zoom" title="View Larger Image" aria-label="View Larger Image" data-fig-id="fig6"/>
+                            </div>
+                        </div>
+                        <div class="figcaption">
+                            <b class="title">Fig. 6. </b>
+                            <fig>
+                                <p>Example of nearest neighbor queries with different patch sizes. The Trevi Fountain patch data set was
+ queried using different patch sizes. The rows are arranged in decreasing order by patch size. The query patch is on
+ the left of each panel, while the following five patches are the nearest neighbors from a set of 100,000 patches.
+ Incorrect matches with respect to ground truth are shown with an X.</p>
+                            </fig>
+                        </div>
+                        <p class="links">
+                            <button ref-type="fig-link" data-docId="6809191" class="all">Show All</button>
+                        </p>
+                    </div>
+                </div>
+                <div class="section_2" id="sec4.1.2">
+                    <h4>4.1.2 Search Precision</h4>
+                    <p>
+                        We use several data sets of different sizes for the experiments in <a ref-type="fig" anchor="fig7" class="fulltext-link">Fig. 7</a>
+                        . We
+ construct 100K and 1 million SIFT feature data sets by randomly sampling a data set of over 5 million SIFT
+ features extracted from a collection of CD cover images <a ref-type="bibr" anchor="ref24" id="context_ref_24_4.1.2" data-range="ref24" href="javascript:void()">[24]</a>
+                        .
+<a ref-type="fn" anchor="fn3" class="footnote-link"/>We also use the 31 million SIFT feature data set from the same source.
+
+                    </p>
+                    <div class="figure figure-full" id="fig7">
+                        <!--
+          Workaround for combined images.Eg.- 1000116 Fig. 5
+        -->
+                        <div class="img-wrap">
+                            <a href="/mediastore/IEEE/content/media/34/6914638/6809191/muja7-2321376-large.gif" data-fig-id="fig7">
+                                <img src="/mediastore/IEEE/content/media/34/6914638/6809191/muja7-2321376-small.gif" loading="lazy" alt="Fig. 7. - Search speedup for different data set sizes."/>
+                            </a>
+                            <div class="zoom-container">
+                                <button class="zoom" title="View Larger Image" aria-label="View Larger Image" data-fig-id="fig7"/>
+                            </div>
+                        </div>
+                        <div class="figcaption">
+                            <b class="title">Fig. 7. </b>
+                            <fig>
+                                <p>Search speedup for different data set sizes.</p>
+                            </fig>
+                        </div>
+                        <p class="links">
+                            <button ref-type="fig-link" data-docId="6809191" class="all">Show All</button>
+                        </p>
+                    </div>
+                    <p>
+                        The desired search precision determines the degree of speedup that can be obtained with any approximate algorithm.
+ Looking at <a ref-type="fig" anchor="fig7" class="fulltext-link">Fig. 7</a>
+                        (the sift1M data set) we see that if we are willing to accept
+ a precision as low as 60 percent, meaning that 40 percent of the neighbors returned are not the exact nearest
+ neighbors, but just approximations, we can achieve a speedup of three orders of magnitude over linear search (using
+ the multiple randomized kd-trees). However, if we require a precision greater than 90 percent the speedup is smaller,
+ less than 2 orders of magnitude (using the priority search k-means tree).
+                    </p>
+                    <p class="has-inline-formula">
+                        We compare the two algorithms we found to be the best at finding fast approximate nearest neighbors (the multiple
+ randomized kd-trees and the priority search k-means tree) with existing approaches, the ANN 
+<a ref-type="bibr" anchor="ref11" id="context_ref_11_4.1.2" data-range="ref11" href="javascript:void()">[11]</a>
+                        and LSH algorithms <a ref-type="bibr" anchor="ref29" id="context_ref_29_4.1.2" data-range="ref29" href="javascript:void()">[29]</a>
+                        <a ref-type="fn" anchor="fn4" class="footnote-link"/>
+                        on the first data set of 100,000 SIFT features. Since the LSH implementation (the E
+
+                        <inline-formula class="inline-formula">
+                            <tex-math>$^2$</tex-math>
+                        </inline-formula>
+                        LSH package) solves the 
+                        <inline-formula class="inline-formula">
+                            <tex-math>$R$</tex-math>
+                        </inline-formula>
+                        -near neighbor problem (finds the
+ neighbors within a radius 
+                        <inline-formula class="inline-formula">
+                            <tex-math>$R$</tex-math>
+                        </inline-formula>
+                        of the query point, not the
+ nearest neighbors), to find the nearest neighbors we have used the approach suggested in the E
+                        <inline-formula class="inline-formula">
+                            <tex-math>$^2$</tex-math>
+                        </inline-formula>
+                        LSH’s user manual: we compute the 
+                        <inline-formula class="inline-formula">
+                            <tex-math>$R$</tex-math>
+                        </inline-formula>
+                        -near neighbors for increasing
+ values of 
+                        <inline-formula class="inline-formula">
+                            <tex-math>$R$</tex-math>
+                        </inline-formula>
+                        . The parameters for the LSH algorithm were chosen using the parameter estimation tool
+ included in the E
+                        <inline-formula class="inline-formula">
+                            <tex-math>$^2$</tex-math>
+                        </inline-formula>
+                        LSH package. For each case we have
+ computed the precision achieved as the percentage of the query points for which the nearest neighbors were correctly
+ found. <a ref-type="fig" anchor="fig8" class="fulltext-link">Fig. 8</a>
+                        shows that the priority search k-means algorithm outperforms both
+ the ANN and LSH algorithms by about an order of magnitude. The results for ANN are consistent with the experiment in 
+<a ref-type="fig" anchor="fig1" class="fulltext-link">Fig. 1</a>
+                        , as ANN uses only a single kd-tree and does not benefit from the speedup
+ due to using multiple randomized trees.
+
+                    </p>
+                    <div class="figure figure-full" id="fig8">
+                        <!--
+          Workaround for combined images.Eg.- 1000116 Fig. 5
+        -->
+                        <div class="img-wrap">
+                            <a href="/mediastore/IEEE/content/media/34/6914638/6809191/muja8-2321376-large.gif" data-fig-id="fig8">
+                                <img src="/mediastore/IEEE/content/media/34/6914638/6809191/muja8-2321376-small.gif" loading="lazy" alt="Fig. 8. - Comparison of the search efficiency for several nearest neighbor algorithms."/>
+                            </a>
+                            <div class="zoom-container">
+                                <button class="zoom" title="View Larger Image" aria-label="View Larger Image" data-fig-id="fig8"/>
+                            </div>
+                        </div>
+                        <div class="figcaption">
+                            <b class="title">Fig. 8. </b>
+                            <fig>
+                                <p>Comparison of the search efficiency for several nearest neighbor algorithms.</p>
+                            </fig>
+                        </div>
+                        <p class="links">
+                            <button ref-type="fig-link" data-docId="6809191" class="all">Show All</button>
+                        </p>
+                    </div>
+                    <p>
+                        <a ref-type="fig" anchor="fig9" class="fulltext-link">Fig. 9</a>
+                        compares the performance of nearest neighbor matching when the data
+ set contains true matches for each feature in the test set to the case when it contains false matches. A true match is
+ a match in which the query and the nearest neighbor point represent the same entity, for example, in case of SIFT
+ features, they represent image patches of the same object. In this experiment we used two 100K SIFT features data
+ sets, one that has ground truth determined from global image matching and one that is randomly sampled from a 5
+ million SIFT features data set and it contains only false matches for each feature in the test set. Our experiments
+ showed that the randomized kd-trees have a significantly better performance for true matches, when the query features
+ are likely to be significantly closer than other neighbors. Similar results were reported in 
+<a ref-type="bibr" anchor="ref54" id="context_ref_54_4.1.2" data-range="ref54" href="javascript:void()">[54]</a>
+                        .
+
+                    </p>
+                    <div class="figure figure-full" id="fig9">
+                        <!--
+          Workaround for combined images.Eg.- 1000116 Fig. 5
+        -->
+                        <div class="img-wrap">
+                            <a href="/mediastore/IEEE/content/media/34/6914638/6809191/muja9-2321376-large.gif" data-fig-id="fig9">
+                                <img src="/mediastore/IEEE/content/media/34/6914638/6809191/muja9-2321376-small.gif" loading="lazy" alt="Fig. 9. - Search speedup when the query points don’t have “true” matches in the data set versus the&#10; case when they have."/>
+                            </a>
+                            <div class="zoom-container">
+                                <button class="zoom" title="View Larger Image" aria-label="View Larger Image" data-fig-id="fig9"/>
+                            </div>
+                        </div>
+                        <div class="figcaption">
+                            <b class="title">Fig. 9. </b>
+                            <fig>
+                                <p>Search speedup when the query points don’t have “true” matches in the data set versus the
+ case when they have.</p>
+                            </fig>
+                        </div>
+                        <p class="links">
+                            <button ref-type="fig-link" data-docId="6809191" class="all">Show All</button>
+                        </p>
+                    </div>
+                    <p>
+                        <a ref-type="fig" anchor="fig10" class="fulltext-link">Fig. 10</a>
+                        shows the difference in performance between the randomized kd-trees
+ and the priority search k-means tree for one of the Winder/Brown patches data set. In this case, the randomized
+ kd-trees algorithm clearly outperforms the priority search k-means algorithm everywhere except for precisions close to
+ 100 percent. It appears that the kd-tree works much better in cases when the intrinsic dimensionality of the data is
+ much lower than the actual dimensionality, presumably because it can better exploit the correlations among dimensions.
+ However, <a ref-type="fig" anchor="fig7" class="fulltext-link">Fig. 7</a>
+                        shows that the k-means tree can perform better for other data
+ sets (especially for high precisions). This shows the importance of performing algorithm selection on each data set.
+
+                    </p>
+                    <div class="figure figure-full" id="fig10">
+                        <!--
+          Workaround for combined images.Eg.- 1000116 Fig. 5
+        -->
+                        <div class="img-wrap">
+                            <a href="/mediastore/IEEE/content/media/34/6914638/6809191/muja10-2321376-large.gif" data-fig-id="fig10">
+                                <img src="/mediastore/IEEE/content/media/34/6914638/6809191/muja10-2321376-small.gif" loading="lazy" alt="Fig. 10. - Search speedup for the Trevi Fountain patches data set."/>
+                            </a>
+                            <div class="zoom-container">
+                                <button class="zoom" title="View Larger Image" aria-label="View Larger Image" data-fig-id="fig10"/>
+                            </div>
+                        </div>
+                        <div class="figcaption">
+                            <b class="title">Fig. 10. </b>
+                            <fig>
+                                <p>Search speedup for the Trevi Fountain patches data set.</p>
+                            </fig>
+                        </div>
+                        <p class="links">
+                            <button ref-type="fig-link" data-docId="6809191" class="all">Show All</button>
+                        </p>
+                    </div>
+                </div>
+                <div class="section_2" id="sec4.1.3">
+                    <h4>4.1.3 Automatic Selection of Optimal Algorithm</h4>
+                    <p class="has-inline-formula">
+                        In <a ref-type="table" anchor="table1" class="fulltext-link">Table 1</a>
+                        , we show the results from running the parameter selection
+ procedure described in <a ref-type="sec" anchor="sec3.4" class="fulltext-link">Section 3.4</a>
+                        on a data set containing 100K randomly
+ sampled SIFT features. We used two different search precisions (60 and 90 percent) and several combinations of the
+ tradeoff factors 
+                        <inline-formula class="inline-formula">
+                            <tex-math>$w_b$</tex-math>
+                        </inline-formula>
+                        and 
+                        <inline-formula class="inline-formula">
+                            <tex-math>$w_m$</tex-math>
+                        </inline-formula>
+                        .
+ For the build time weight, 
+                        <inline-formula class="inline-formula">
+                            <tex-math>$w_b$</tex-math>
+                        </inline-formula>
+                        , we used three different possible
+ values: 0 representing the case where we don’t care about the tree build time, 1 for the case where the tree
+ build time and search time have the same importance and 0.01 representing the case where we care mainly about the
+ search time but we also want to avoid a large build time. Similarly, the memory weight was chosen to be 0 for the case
+ where the memory usage is not a concern, 
+                        <inline-formula class="inline-formula">
+                            <tex-math>$\infty$</tex-math>
+                        </inline-formula>
+                        representing the case where the
+ memory use is the dominant concern and 1 as a middle ground between the two cases.
+
+                    <div class="figure figure-full table" id="table1">
+                        <div class="figcaption">
+                            <b class="title">TABLE 1 </b>
+                            The Algorithms Chosen by Our Automatic Algorithm and Parameter Selection Procedure (sift100K Data Set)
+
+                        </div>
+                        <div class="img-wrap">
+                            <a href="/mediastore/IEEE/content/media/34/6914638/6809191/muja.t1-2321376-large.gif">
+                                <img src="/mediastore/IEEE/content/media/34/6914638/6809191/muja.t1-2321376-small.gif" loading="lazy" alt="Table 1- The Algorithms Chosen by Our Automatic Algorithm and Parameter Selection Procedure (sift100K Data Set)&#10;"/>
+                            </a>
+                            <div class="zoom-container">
+                                <button class="zoom" title="View Larger Image" aria-label="View Larger Image" data-type="table" data-src="/mediastore/IEEE/content/media/34/6914638/6809191/muja.t1-2321376-large.gif" data-fig-id="table1"/>
+                            </div>
+                        </div>
+                    </div>
+</p></div></div>
+<div class="section_2" id="sec4.2">
+    <h3>4.2 Binary Features</h3>
+    <p>
+        This section evaluates the performance of the hierarchical clustering tree described in 
+<a ref-type="sec" anchor="sec3.3" class="fulltext-link">Section 3.3</a>
+        .
+    </p>
+    <p class="has-inline-formula">
+        We use the Winder/Brown patches data set <a ref-type="bibr" anchor="ref53" id="context_ref_53_4.2" data-range="ref53" href="javascript:void()">[53]</a>
+        to compare the nearest
+ neighbor search performance of the hierarchical clustering tree to that of other well known nearest neighbor search
+ algorithms. For the comparison we use a combination of both vector features such as SIFT, SURF, image patches and
+ binary features such as BRIEF and ORB. The image patches have been downscaled to 
+        <inline-formula class="inline-formula">
+            <tex-math>$16\times
+ 16$</tex-math>
+        </inline-formula>
+        pixels and are matched using normalized cross correlation. <a ref-type="fig" anchor="fig11" class="fulltext-link">Fig. 11</a>
+        shows the
+ nearest neighbor search times for the different feature types. Each point on the graph is computed using the best
+ performing algorithm for that particular feature type (randomized kd-trees or priority search k-means tree for SIFT,
+ SURF, image patches and the hierarchical clustering algorithm for BRIEF and ORB). In each case the optimum choice of
+ parameters that maximizes the speedup for a given precision is used.
+
+    </p>
+    <div class="figure figure-full" id="fig11">
+        <!--
+          Workaround for combined images.Eg.- 1000116 Fig. 5
+        -->
+        <div class="img-wrap">
+            <a href="/mediastore/IEEE/content/media/34/6914638/6809191/muja11-2321376-large.gif" data-fig-id="fig11">
+                <img src="/mediastore/IEEE/content/media/34/6914638/6809191/muja11-2321376-small.gif" loading="lazy" alt="Fig. 11. - Absolute search time for different popular feature types (both binary and vector)."/>
+            </a>
+            <div class="zoom-container">
+                <button class="zoom" title="View Larger Image" aria-label="View Larger Image" data-fig-id="fig11"/>
+            </div>
+        </div>
+        <div class="figcaption">
+            <b class="title">Fig. 11. </b>
+            <fig>
+                <p>Absolute search time for different popular feature types (both binary and vector).</p>
+            </fig>
+        </div>
+        <p class="links">
+            <button ref-type="fig-link" data-docId="6809191" class="all">Show All</button>
+        </p>
+    </div>
+    <p>
+        In <a ref-type="fig" anchor="fig12" class="fulltext-link">Fig. 12</a>
+        we compare the hierarchical clustering tree with a multi-probe
+ locality sensitive hashing implementation <a ref-type="bibr" anchor="ref30" id="context_ref_30_4.2" data-range="ref30" href="javascript:void()">[30]</a>
+        . For the comparison we used
+ data sets of BRIEF and ORB features extracted from the recognition benchmark images data set of 
+<a ref-type="bibr" anchor="ref24" id="context_ref_24_4.2" data-range="ref24" href="javascript:void()">[24]</a>
+        , containing close to 5 million features. It can be seen that the
+ hierarchical clustering index outperforms the LSH implementation for this data set. The LSH implementation also
+ requires significantly more memory compared to the hierarchical clustering trees for when high precision is required,
+ as it needs to allocate a large number of hash tables to achieve the high search precision. In the experiment of 
+<a ref-type="fig" anchor="fig12" class="fulltext-link">Fig. 12</a>
+        , the multi-probe LSH required six times more memory than the
+ hierarchical search for search precisions above 90 percent.
+
+    </p>
+    <div class="figure figure-full" id="fig12">
+        <!--
+          Workaround for combined images.Eg.- 1000116 Fig. 5
+        -->
+        <div class="img-wrap">
+            <a href="/mediastore/IEEE/content/media/34/6914638/6809191/muja12-2321376-large.gif" data-fig-id="fig12">
+                <img src="/mediastore/IEEE/content/media/34/6914638/6809191/muja12-2321376-small.gif" loading="lazy" alt="Fig. 12. - Comparison between the hierarchical clustering index and LSH for the Nister/Stewenius recognition benchmark&#10; images data set of about 5 million features."/>
+            </a>
+            <div class="zoom-container">
+                <button class="zoom" title="View Larger Image" aria-label="View Larger Image" data-fig-id="fig12"/>
+            </div>
+        </div>
+        <div class="figcaption">
+            <b class="title">Fig. 12. </b>
+            <fig>
+                <p>Comparison between the hierarchical clustering index and LSH for the Nister/Stewenius recognition benchmark
+ images data set of about 5 million features.</p>
+            </fig>
+        </div>
+        <p class="links">
+            <button ref-type="fig-link" data-docId="6809191" class="all">Show All</button>
+        </p>
+    </div>
+</div>
+</div>
+<div class="section" id="sec5">
+    <div class="header article-hdr">
+        <div class="kicker">SECTION 5</div>
+        <h2>Scaling Nearest Neighbor Search</h2>
+    </div>
+    <p>
+        Many papers have shown that using simple non-parametric methods in conjunction with large scale data sets can lead
+ to very good recognition performance <a ref-type="bibr" anchor="ref4" id="context_ref_4_5" data-range="ref4" href="javascript:void()">[4]</a>
+        <a ref-type="bibr" anchor="ref7" id="context_ref_7_5" data-range="ref7" href="javascript:void()">[7]
+</a>
+        <a ref-type="bibr" anchor="ref55" id="context_ref_55_5" data-range="ref55" href="javascript:void()">[55]</a>
+        <a ref-type="bibr" anchor="ref56" id="context_ref_56_5" data-range="ref56" href="javascript:void()">[56]</a>
+        . Scaling to such
+ large data sets is a difficult task, one of the main challenges being the impossibility of loading the data into the
+ main memory of a single machine. For example, the size of the raw tiny images data set of 
+<a ref-type="bibr" anchor="ref7" id="context_ref_7_5" data-range="ref7" href="javascript:void()">[7]</a>
+        is about 240 GB, which is greater than what can be found on most
+ computers at present. Fitting the data in memory is even more problematic for data sets of the size of those used in 
+<a ref-type="bibr" anchor="ref4" id="context_ref_4_5" data-range="ref4" href="javascript:void()">[4]</a>
+        <a ref-type="bibr" anchor="ref8" id="context_ref_8_5" data-range="ref8" href="javascript:void()">[8]</a>
+        <a ref-type="bibr" anchor="ref55" id="context_ref_55_5" data-range="ref55" href="javascript:void()">[55]</a>
+        .
+    </p>
+    <p>When dealing with such large amounts of data, possible solutions include performing some dimensionality reduction on
+ the data, keeping the data on the disk and loading only parts of it in the main memory or distributing the data on
+ several computers and using a distributed nearest neighbor search algorithm.</p>
+    <p>
+        Dimensionality reduction has been used in the literature with good results (<a ref-type="bibr" anchor="ref7" id="context_ref_7_5" data-range="ref7" href="javascript:void()">[7]
+</a>
+        <a ref-type="bibr" anchor="ref27" id="context_ref_27_5" data-range="ref27" href="javascript:void()">[27]</a>
+        <a ref-type="bibr" anchor="ref28" id="context_ref_28_5" data-range="ref28" href="javascript:void()">[28]</a>
+        <a ref-type="bibr" anchor="ref32" id="context_ref_32_5" data-range="ref32" href="javascript:void()">[32]</a>
+        <a ref-type="bibr" anchor="ref57" id="context_ref_57_5" data-range="ref57" href="javascript:void()">[57]</a>
+        ), however even with
+ dimensionality reduction it can be challenging to fit the data in the memory of a single machine for very large data
+ sets. Storing the data on the disk involves significant performance penalties due to the performance gap between
+ memory and disk access times. In FLANN we used the approach of performing distributed nearest neighbor search across
+ multiple machines.
+    </p>
+    <div class="section_2" id="sec5.1">
+        <h3>5.1 Searching on a Compute Cluster</h3>
+        <p class="has-inline-formula">
+            In order to scale to very large data sets, we use the approach of distributing the data to multiple machines in a
+ compute cluster and perform the nearest neighbor search using all the machines in parallel. The data is distributed
+ equally between the machines, such that for a cluster of 
+            <inline-formula class="inline-formula">
+                <tex-math>$N$</tex-math>
+            </inline-formula>
+            machines each of them will only
+ have to index and search 
+            <inline-formula class="inline-formula">
+                <tex-math>$1/N$</tex-math>
+            </inline-formula>
+            of the whole data set (although
+ the ratios can be changed to have more data on some machines than others). The final result of the nearest neighbor
+ search is obtained by merging the partial results from all the machines in the cluster once they have completed the
+ search.
+        </p>
+        <p>In order to distribute the nearest neighbor matching on a compute cluster we implemented a Map-Reduce like algorithm
+ using the message passing interface (MPI) specification.</p>
+        <p>Algorithm 4 describes the procedure for building a distributed nearest neighbor matching index. Each process in the
+ cluster executes in parallel and reads from a distributed filesystem a fraction of the data set. All processes build
+ the nearest neighbor search index in parallel using their respective data set fractions.
+</p>
+        <div class="figure figure-full" id="x4">
+            <!--
+          Workaround for combined images.Eg.- 1000116 Fig. 5
+        -->
+            <div class="img-wrap">
+                <a href="/mediastore/IEEE/content/media/34/6914638/6809191/muja.x4-2321376-large.gif" data-fig-id="x4">
+                    <img src="/mediastore/IEEE/content/media/34/6914638/6809191/muja.x4-2321376-small.gif" loading="lazy" alt=" - "/>
+                </a>
+                <div class="zoom-container">
+                    <button class="zoom" title="View Larger Image" aria-label="View Larger Image" data-fig-id="x4"/>
+                </div>
+            </div>
+            <div class="figcaption">
+                <b class="title"></b>
+                <fig/>
+            </div>
+            <p class="links">
+                <button ref-type="fig-link" data-docId="6809191" class="all">Show All</button>
+            </p>
+        </div>
+        <p>
+            In order to search the distributed index the query is sent from a client to one of the computers in the MPI cluster,
+ which we call the master server (see <a ref-type="fig" anchor="fig13" class="fulltext-link">Fig. 13</a>
+            ). By convention the master server
+ is the process with rank 0 in the MPI cluster, however any process in the MPI cluster can play the role of master
+ server.
+
+        </p>
+        <div class="figure figure-full" id="fig13">
+            <!--
+          Workaround for combined images.Eg.- 1000116 Fig. 5
+        -->
+            <div class="img-wrap">
+                <a href="/mediastore/IEEE/content/media/34/6914638/6809191/muja13-2321376-large.gif" data-fig-id="fig13">
+                    <img src="/mediastore/IEEE/content/media/34/6914638/6809191/muja13-2321376-small.gif" loading="lazy" alt="Fig. 13. - Scaling nearest neighbor search on a compute cluster using message passing interface standard."/>
+                </a>
+                <div class="zoom-container">
+                    <button class="zoom" title="View Larger Image" aria-label="View Larger Image" data-fig-id="fig13"/>
+                </div>
+            </div>
+            <div class="figcaption">
+                <b class="title">Fig. 13. </b>
+                <fig>
+                    <p>Scaling nearest neighbor search on a compute cluster using message passing interface standard.</p>
+                </fig>
+            </div>
+            <p class="links">
+                <button ref-type="fig-link" data-docId="6809191" class="all">Show All</button>
+            </p>
+        </div>
+        <p>The master server broadcasts the query to all of the processes in the cluster and then each process can run the
+ nearest neighbor matching in parallel on its own fraction of the data. When the search is complete an MPI reduce
+ operation is used to merge the results back to the master process and the final result is returned to the client.</p>
+        <p>The master server is not a bottleneck when merging the results. The MPI reduce operation is also distributed, as the
+ partial results are merged two by two in a hierarchical fashion from the servers in the cluster to the master server.
+ Additionally, the merge operation is very efficient, since the distances between the query and the neighbors
+ don’t have to be re-computed as they are returned by the nearest neighbor search operations on each server.
+</p>
+        <div class="figure figure-full" id="x5">
+            <!--
+          Workaround for combined images.Eg.- 1000116 Fig. 5
+        -->
+            <div class="img-wrap">
+                <a href="/mediastore/IEEE/content/media/34/6914638/6809191/muja.x5-2321376-large.gif" data-fig-id="x5">
+                    <img src="/mediastore/IEEE/content/media/34/6914638/6809191/muja.x5-2321376-small.gif" loading="lazy" alt=" - "/>
+                </a>
+                <div class="zoom-container">
+                    <button class="zoom" title="View Larger Image" aria-label="View Larger Image" data-fig-id="x5"/>
+                </div>
+            </div>
+            <div class="figcaption">
+                <b class="title"></b>
+                <fig/>
+            </div>
+            <p class="links">
+                <button ref-type="fig-link" data-docId="6809191" class="all">Show All</button>
+            </p>
+        </div>
+        <p>
+            When distributing a large data set for the purpose of nearest neighbor search we chose to partition the data into
+ multiple disjoint subsets and construct independent indexes for each of those subsets. During search the query is
+ broadcast to all the indexes and each of them performs the nearest neighbor search within its associated data. In a
+ different approach, Aly et al. <a ref-type="bibr" anchor="ref58" id="context_ref_58_5.1" data-range="ref58" href="javascript:void()">[58]</a>
+            introduce a distributed k-d tree
+ implementation where they place a root k-d tree on top of all the other trees (leaf trees) with the role of selecting
+ a subset of trees to be searched and only send the query to those trees. They show the distributed k-d tree has higher
+ throughput compared to using independent trees, due to the fact that only a portion of the trees need to be searched
+ by each query.
+        </p>
+        <p>
+            The partitioning of the data set into independent subsets, as described above and implemented in FLANN, has the
+ advantage that it doesn’t depend on the type of index used (randomized kd-trees, priority search k-means tree,
+ hierarchical clustering, LSH) and can be applied to any current or future nearest neighbor algorithm in FLANN. In the
+ distributed k-d tree implementation of <a ref-type="bibr" anchor="ref58" id="context_ref_58_5.1" data-range="ref58" href="javascript:void()">[58]</a>
+            the search does not backtrack in
+ the root node, so it is possible that subsets of the data containing near points are not searched at all if the root
+ k-d tree doesn’t select the corresponding leaf k-d trees at the beginning.
+        </p>
+    </div>
+    <div class="section_2" id="sec5.2">
+        <h3>5.2 Evaluation of Distributed Search</h3>
+        <p>
+            In this section we present several experiments that demonstrate the effectiveness of the distributed nearest
+ neighbor matching framework in FLANN. For these experiments we have used the 80 million patch data set of 
+<a ref-type="bibr" anchor="ref7" id="context_ref_7_5.2" data-range="ref7" href="javascript:void()">[7]</a>
+            .
+        </p>
+        <p>
+            In an MPI distributed system it’s possible to run multiple parallel processes on the same machine, the
+ recommended approach is to run as many processes as CPU cores on the machine. <a ref-type="fig" anchor="fig14" class="fulltext-link">Fig. 14
+</a>
+            presents the results of an experiment in which we run multiple MPI processes on a single machine with eight CPU
+ cores. It can be seen that the overall performance improves when increasing the number of processes from 1 to 4,
+ however there is a decrease in performance when moving from four to eight parallel processes. This can be explained by
+ the fact that increasing the parallelism on the same machine also increases the number of requests to the main memory
+ (since all processes share the same main memory), and at some point the bottleneck moves from the CPU to the memory.
+ Increasing the parallelism past this point results in decreased performance. <a ref-type="fig" anchor="fig14" class="fulltext-link">Fig. 14
+</a>
+            also shows the direct search performance obtained by using FLANN directly without the MPI layer. As expected,
+ the direct search performance is identical to the performance obtained when using the MPI layer with a single process,
+ showing no significant overhead from the MPI runtime. For this experiment and the one in 
+<a ref-type="fig" anchor="fig15" class="fulltext-link">Fig. 15</a>
+            we used a subset of only 8 million tiny images to be able to run the
+ experiment on a single machine.
+
+        </p>
+        <div class="figure figure-full" id="fig14">
+            <!--
+          Workaround for combined images.Eg.- 1000116 Fig. 5
+        -->
+            <div class="img-wrap">
+                <a href="/mediastore/IEEE/content/media/34/6914638/6809191/muja14-2321376-large.gif" data-fig-id="fig14">
+                    <img src="/mediastore/IEEE/content/media/34/6914638/6809191/muja14-2321376-small.gif" loading="lazy" alt="Fig. 14. - Distributing nearest neighbor search on a single multi-core machine. When the degree of parallelism&#10; increases beyond a certain point the memory access becomes a bottleneck. The “direct search” case&#10; corresponds to using the FLANN library directly, without the MPI layer."/>
+                </a>
+                <div class="zoom-container">
+                    <button class="zoom" title="View Larger Image" aria-label="View Larger Image" data-fig-id="fig14"/>
+                </div>
+            </div>
+            <div class="figcaption">
+                <b class="title">Fig. 14. </b>
+                <fig>
+                    <p>Distributing nearest neighbor search on a single multi-core machine. When the degree of parallelism
+ increases beyond a certain point the memory access becomes a bottleneck. The “direct search” case
+ corresponds to using the FLANN library directly, without the MPI layer.</p>
+                </fig>
+            </div>
+            <p class="links">
+                <button ref-type="fig-link" data-docId="6809191" class="all">Show All</button>
+            </p>
+        </div>
+        <p></p>
+        <div class="figure figure-full" id="fig15">
+            <!--
+          Workaround for combined images.Eg.- 1000116 Fig. 5
+        -->
+            <div class="img-wrap">
+                <a href="/mediastore/IEEE/content/media/34/6914638/6809191/muja15-2321376-large.gif" data-fig-id="fig15">
+                    <img src="/mediastore/IEEE/content/media/34/6914638/6809191/muja15-2321376-small.gif" loading="lazy" alt="Fig. 15. - The advantage of distributing the search to multiple machines. Even when using the same number of parallel&#10; processes, distributing the computation to multiple machines still leads to an improvement in performance due to less&#10; memory access overhead. “Direct search” corresponds to using FLANN without the MPI layer and is provided&#10; as a comparison baseline."/>
+                </a>
+                <div class="zoom-container">
+                    <button class="zoom" title="View Larger Image" aria-label="View Larger Image" data-fig-id="fig15"/>
+                </div>
+            </div>
+            <div class="figcaption">
+                <b class="title">Fig. 15. </b>
+                <fig>
+                    <p>The advantage of distributing the search to multiple machines. Even when using the same number of parallel
+ processes, distributing the computation to multiple machines still leads to an improvement in performance due to less
+ memory access overhead. “Direct search” corresponds to using FLANN without the MPI layer and is provided
+ as a comparison baseline.</p>
+                </fig>
+            </div>
+            <p class="links">
+                <button ref-type="fig-link" data-docId="6809191" class="all">Show All</button>
+            </p>
+        </div>
+        <p>
+            <a ref-type="fig" anchor="fig15" class="fulltext-link">Fig. 15</a>
+            shows the performance obtained by using eight parallel processes on
+ one, two or three machines. Even though the same number of parallel processes are used, it can be seen that the
+ performance increases when those processes are distributed on more machines. This can also be explained by the memory
+ access overhead, since when more machines are used, fewer processes are running on each machine, requiring fewer
+ memory accesses.
+        </p>
+        <p>
+            <a ref-type="fig" anchor="fig16" class="fulltext-link">Fig. 16</a>
+            shows the search speedup for the data set of 80 million tiny images
+ of <a ref-type="bibr" anchor="ref7" id="context_ref_7_5.2" data-range="ref7" href="javascript:void()">[7]</a>
+            . The algorithm used is the radomized k-d tree forest as it was
+ determined by the auto-tuning procedure to be the most efficient in this case. It can be seen that the search
+ performance scales well with the data set size and it benefits from using multiple parallel processes.
+
+        </p>
+        <div class="figure figure-full" id="fig16">
+            <!--
+          Workaround for combined images.Eg.- 1000116 Fig. 5
+        -->
+            <div class="img-wrap">
+                <a href="/mediastore/IEEE/content/media/34/6914638/6809191/muja16-2321376-large.gif" data-fig-id="fig16">
+                    <img src="/mediastore/IEEE/content/media/34/6914638/6809191/muja16-2321376-small.gif" loading="lazy" alt="Fig. 16. - Matching 80 million tiny images directly using a compute cluster."/>
+                </a>
+                <div class="zoom-container">
+                    <button class="zoom" title="View Larger Image" aria-label="View Larger Image" data-fig-id="fig16"/>
+                </div>
+            </div>
+            <div class="figcaption">
+                <b class="title">Fig. 16. </b>
+                <fig>
+                    <p>Matching 80 million tiny images directly using a compute cluster.</p>
+                </fig>
+            </div>
+            <p class="links">
+                <button ref-type="fig-link" data-docId="6809191" class="all">Show All</button>
+            </p>
+        </div>
+        <p class="has-inline-formula">
+            All the previous experiments have shown that distributing the nearest neighbor search to multiple machines results
+ in an overall increase in performance in addition to the advantage of being able to use more memory. Ideally, when
+ distributing the search to 
+            <inline-formula class="inline-formula">
+                <tex-math>$N$</tex-math>
+            </inline-formula>
+            machines the speedup would be 
+
+            <inline-formula class="inline-formula">
+                <tex-math>$N$</tex-math>
+            </inline-formula>
+            times higher, however in practice for approximate nearest neighbor search the speedup
+ is smaller due to the fact that the search on each of the machines has sub-linear complexity in the size of the input
+ data set.
+        </p>
+    </div>
+</div>
+<div class="section" id="sec6">
+    <div class="header article-hdr">
+        <div class="kicker">SECTION 6</div>
+        <h2>The FLANN Library</h2>
+    </div>
+    <p>
+        The work presented in this paper has been made publicly available as an open source library named Fast Library for
+ Approximate Nearest Neighbors<a ref-type="fn" anchor="fn5" class="footnote-link"/>
+        <a ref-type="bibr" anchor="ref59" id="context_ref_59_6" data-range="ref59" href="javascript:void()">[59]</a>
+        .
+    </p>
+    <p>
+        FLANN is used in a large number of both research and industry projects (e.g., <a ref-type="bibr" anchor="ref60" id="context_ref_60_6" data-range="ref60" href="javascript:void()">[60]
+</a>
+        <a ref-type="bibr" anchor="ref61" id="context_ref_61_6" data-range="ref61" href="javascript:void()">[61]</a>
+        <a ref-type="bibr" anchor="ref62" id="context_ref_62_6" data-range="ref62" href="javascript:void()">[62]</a>
+        <a ref-type="bibr" anchor="ref63" id="context_ref_63_6" data-range="ref63" href="javascript:void()">[63]</a>
+        <a ref-type="bibr" anchor="ref64" id="context_ref_64_6" data-range="ref64" href="javascript:void()">[64]</a>
+        ) and is widely used in the
+ computer vision community, in part due to its inclusion in OpenCV <a ref-type="bibr" anchor="ref65" id="context_ref_65_6" data-range="ref65" href="javascript:void()">[65]</a>
+        , the
+ popular open source computer vision library. FLANN also is used by other well known open source projects, such as the
+ point cloud library (PCL) and the robot operating system (ROS) <a ref-type="bibr" anchor="ref63" id="context_ref_63_6" data-range="ref63" href="javascript:void()">[63]</a>
+        . FLANN
+ has been packaged by most of the mainstream Linux distributions such as Debian, Ubuntu, Fedora, Arch, Gentoo and their
+ derivatives.
+    </p>
+</div>
+<div class="section" id="sec7">
+    <div class="header article-hdr">
+        <div class="kicker">SECTION 7</div>
+        <h2>Conclusions</h2>
+    </div>
+    <p>This paper addresses the problem of fast nearest neighbor search in high dimensional spaces, a core problem in many
+ computer vision and machine learning algorithms and which is often the most computationally expensive part of these
+ algorithms. We present and compare the algorithms we have found to work best at fast approximate search in high
+ dimensional spaces: the randomized k-d trees and a newly introduced algorithm, the priority search k-means tree. We
+ introduce a new algorithm for fast approximate matching of binary features. We address the issues arising when scaling
+ to very large size data sets by proposing an algorithm for distributed nearest neighbor matching on compute clusters.
+</p>
+</div>
+</div></div>
