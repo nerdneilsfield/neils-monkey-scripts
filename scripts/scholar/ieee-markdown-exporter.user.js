@@ -388,6 +388,8 @@
       // ★ 新增：仅在数学环境内解码 HTML 实体（修复 &lt; &gt; &amp; 等）
       markdown = this.decodeEntitiesInsideMath(markdown);
 
+      markdown = markdown.replace("\\$", "$");
+
       markdown = this.mergeSoftWraps(markdown);
       markdown = this.removeUnnecessaryBlankLines
         ? this.removeUnnecessaryBlankLines(markdown)
