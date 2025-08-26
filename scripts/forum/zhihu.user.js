@@ -11,7 +11,7 @@
 // @grant        none
 // ==/UserScript==
 
-(function() {
+(function () {
     'use strict';
 
     // --- Turndown Configuration ---
@@ -176,7 +176,7 @@
 
             range.addEventListener('input', () => { input.value = range.value; });
             input.addEventListener('input', () => {
-                const v = Math.max(1, parseInt(input.value||'1', 10));
+                const v = Math.max(1, parseInt(input.value || '1', 10));
                 input.value = String(v);
                 range.value = String(Math.min(v, parseInt(range.max, 10)));
             });
@@ -232,15 +232,15 @@
     }
 
     // Console hook
-    (function __zudHookConsole(){
+    (function __zudHookConsole() {
         if (window.__zudConsoleHooked__) return;
         window.__zudConsoleHooked__ = true;
-        const orig = {log: console.log, warn: console.warn, error: console.error};
-        function push(type, args){
+        const orig = { log: console.log, warn: console.warn, error: console.error };
+        function push(type, args) {
             const msg = Array.from(args).map(x => {
                 try {
                     return (typeof x === 'object') ? JSON.stringify(x) : String(x);
-                } catch(_) {
+                } catch (_) {
                     return String(x);
                 }
             }).join(' ');
@@ -254,9 +254,9 @@
                 el.scrollTop = el.scrollHeight;
             }
         }
-        console.log = (...a) => { try{push('log',a);} catch(_){} orig.log(...a); };
-        console.warn = (...a) => { try{push('warn',a);} catch(_){} orig.warn(...a); };
-        console.error = (...a) => { try{push('error',a);} catch(_){} orig.error(...a); };
+        console.log = (...a) => { try { push('log', a); } catch (_) { } orig.log(...a); };
+        console.warn = (...a) => { try { push('warn', a); } catch (_) { } orig.warn(...a); };
+        console.error = (...a) => { try { push('error', a); } catch (_) { } orig.error(...a); };
     })();
 
     // Helper functions
@@ -291,16 +291,16 @@
         try {
             const d = new Date(sec * 1000);
             const y = d.getFullYear();
-            const M = String(d.getMonth()+1).padStart(2,'0');
-            const D = String(d.getDate()).padStart(2,'0');
-            const h = String(d.getHours()).padStart(2,'0');
-            const m = String(d.getMinutes()).padStart(2,'0');
+            const M = String(d.getMonth() + 1).padStart(2, '0');
+            const D = String(d.getDate()).padStart(2, '0');
+            const h = String(d.getHours()).padStart(2, '0');
+            const m = String(d.getMinutes()).padStart(2, '0');
             return `${y}-${M}-${D} ${h}:${m}`;
         } catch (_) { return ''; }
     }
 
     function __mdEscape(s) {
-        return (s||'').toString().replace(/[\*`_\[\]<>]/g, m => `\\${m}`);
+        return (s || '').toString().replace(/[\*`_\[\]<>]/g, m => `\\${m}`);
     }
 
     function __peopleLink(author) {
@@ -316,6 +316,20 @@
         } else {
             await new Promise(resolve => setTimeout(resolve, ms));
         }
+    }
+
+    async function processAnswersWithComments(answers, concurrency = 2) {
+        const results = [];
+        for (let i = 0; i < answers.length; i += concurrency) {
+            const batch = answers.slice(i, i + concurrency);
+            const batchResults = await Promise.all(
+                batch.map(answer => __fetchCommentsViaDOM(answer))
+            );
+            results.push(...batchResults);
+            closeCommentModal(); // 每批次后关闭可能的弹窗
+            await new Promise(r => setTimeout(r, 500));
+        }
+        return results;
     }
 
     function formatDownloadDateTime() {
@@ -493,6 +507,7 @@
                 md += __commentsBlockMarkdown(comments);
             }
 
+            closeCommentModal(); // 确保关闭弹窗
             md += `--- \n\n`;
             await yieldToBrowser(0);
         }
@@ -501,7 +516,7 @@
     }
 
     // Comment fetching functions with better error handling
-    async function __fetchCommentsForAnswer(answerId) {
+    async function __fetchCommentsForAnswer_old(answerId) {
         try {
             const roots = await __fetchAllRootComments(answerId);
             if (!roots || roots.length === 0) {
@@ -520,6 +535,166 @@
             console.warn(`Failed to fetch comments for answer ${answerId}:`, error);
             return [];
         }
+    }
+
+    // 替换原有的评论获取函数
+    async function __fetchCommentsForAnswer(answerElOrId) {
+        let answerEl, answerId;
+        
+        // 参数处理保持不变
+        if (typeof answerElOrId === 'string') {
+            answerId = answerElOrId;
+            answerEl = document.querySelector(`[name="${answerId}"]`) || 
+                       document.querySelector(`[data-zop*="${answerId}"]`);
+            if (!answerEl) {
+                console.warn(`Cannot find answer element for ID: ${answerId}`);
+                return [];
+            }
+        } else if (answerElOrId && answerElOrId.querySelector) {
+            answerEl = answerElOrId;
+            answerId = __getAnswerId(answerEl);
+        } else {
+            console.error('Invalid parameter for __fetchCommentsForAnswer:', answerElOrId);
+            return [];
+        }
+        
+        try {
+            const commentCount = __getCommentCountFromAnswer(answerEl);
+            if (commentCount === '0') return [];
+            
+            // 1. 点击评论按钮
+            const commentBtn = answerEl.querySelector('.ContentItem-actions button:has(.Zi--Comment)');
+            if (!commentBtn) return [];
+            
+            commentBtn.click();
+            await new Promise(r => setTimeout(r, 1500));
+            
+            // 2. 检查是否有"查看全部"按钮
+            const viewAllBtn = answerEl.querySelector('.css-vurnku');
+            if (viewAllBtn && viewAllBtn.textContent.includes('查看全部')) {
+                // 有弹窗的情况
+                viewAllBtn.click();
+                await new Promise(r => setTimeout(r, 2000));
+                
+                const modalContent = document.querySelector('.Modal-content.css-1svde17');
+                if (modalContent) {
+                    const scrollContainer = modalContent.querySelector('.css-34podr');
+                    if (scrollContainer) {
+                        let lastHeight = 0;
+                        for (let i = 0; i < 20; i++) {
+                            scrollContainer.scrollTop = scrollContainer.scrollHeight;
+                            await new Promise(r => setTimeout(r, 800));
+                            if (scrollContainer.scrollHeight === lastHeight) break;
+                            lastHeight = scrollContainer.scrollHeight;
+                        }
+                        
+                        const commentsList = modalContent.querySelector('.css-18ld3w0');
+                        const comments = __extractCommentsFromPopup(commentsList);
+                        closeCommentModal();
+                        return comments;
+                    }
+                }
+            } else {
+                // 3. 没有"查看全部"按钮，从内嵌评论获取
+                const embeddedComments = answerEl.querySelector('.css-18ld3w0');
+                if (embeddedComments) {
+                    const comments = __extractCommentsFromPopup(embeddedComments);
+                    console.log(`Found ${comments.length} embedded comments`);
+                    return comments;
+                }
+            }
+            
+            return [];
+        } catch(e) {
+            console.warn('Failed to get comments:', e);
+            closeCommentModal();
+            return [];
+        }
+    }
+
+    function __extractCommentsFromContainer(container) {
+        const comments = [];
+        const commentItems = container.querySelectorAll('.CommentItem');
+
+        commentItems.forEach(item => {
+            const userLink = item.querySelector('.UserLink');
+            const author = userLink?.textContent || '匿名用户';
+            const content = item.querySelector('.CommentContent')?.textContent || '';
+            const likeCount = item.querySelector('.Button--plain')?.textContent?.match(/\d+/)?.[0] || '0';
+            const time = item.querySelector('time')?.textContent || '';
+
+            if (content) {
+                comments.push({
+                    author: { name: author },
+                    content: content,
+                    like_count: likeCount,
+                    created_time: time
+                });
+            }
+        });
+
+        return comments;
+    }
+
+    // 修复评论提取函数
+    function __extractCommentsFromPopup(commentsList) {
+        const comments = [];
+        const commentItems = commentsList.querySelectorAll('[data-id]');
+
+        commentItems.forEach(item => {
+            const userLink = item.querySelector('a.css-10u695f');
+            const author = userLink?.textContent || '匿名用户';
+            const content = item.querySelector('.CommentContent')?.textContent || '';
+
+            const likeBtn = item.querySelector('.Button--grey');
+            const likeText = likeBtn?.textContent || '0';
+            const likeCount = likeText.match(/\d+/)?.[0] || '0';
+
+            // 修复时间获取
+            const timeEl = item.querySelector('.css-12cl38p');
+            const time = timeEl?.textContent || '';
+
+            const replyTo = item.querySelector('.css-gx7lzm') ?
+                item.querySelectorAll('a.css-10u695f')[1]?.textContent : null;
+
+            if (content) {
+                comments.push({
+                    author: { name: author },
+                    content: content,
+                    like_count: likeCount,
+                    created_time: time,
+                    reply_to: replyTo
+                });
+            }
+        });
+
+        return comments;
+    }
+
+    function closeCommentModal() {
+        const closeBtn = document.querySelector('button[aria-label="关闭"].css-169m58j, button[aria-label="关闭"]:has(.Zi--Close)');
+        if (closeBtn) {
+            closeBtn.click();
+        } else {
+            const event = new KeyboardEvent('keydown', { key: 'Escape', keyCode: 27 });
+            document.dispatchEvent(event);
+        }
+    }
+
+    // 拦截XHR请求获取认证头（备选方案）
+    function interceptXHRHeaders() {
+        const originalOpen = XMLHttpRequest.prototype.open;
+        const originalSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
+
+        window._xhrHeaders = {};
+
+        XMLHttpRequest.prototype.setRequestHeader = function (header, value) {
+            if (header.toLowerCase().startsWith('x-zse-')) {
+                window._xhrHeaders[header] = value;
+                console.log('Captured header:', header, value);
+            }
+            return originalSetRequestHeader.apply(this, arguments);
+        };
     }
 
     async function __fetchAllRootComments(answerId, orderBy = 'score') {
@@ -604,17 +779,40 @@
         return all;
     }
 
-    async function __fetchCommentsForAnswer(answerId) {
-        const roots = await __fetchAllRootComments(answerId);
-        for (const rc of roots) {
-            if ((rc.child_comment_count || 0) > 0) {
-                rc.child_comments_full = await __fetchAllChildComments(rc.id);
-            } else {
-                rc.child_comments_full = [];
-            }
-        }
-        return roots;
+    // async function __fetchCommentsForAnswer(answerId) {
+    //     const roots = await __fetchAllRootComments(answerId);
+    //     for (const rc of roots) {
+    //         if ((rc.child_comment_count || 0) > 0) {
+    //             rc.child_comments_full = await __fetchAllChildComments(rc.id);
+    //         } else {
+    //             rc.child_comments_full = [];
+    //         }
+    //     }
+    //     return roots;
+    // }
+
+    // 在 __commentsBlockMarkdown 函数之前添加：
+
+    function __commentToMarkdown(comment, level = 0) {
+        const indent = '  '.repeat(level);
+        const author = comment.author?.name || '匿名用户';
+        const content = comment.content || comment.comment?.content || '';
+        const likeCount = comment.like_count || comment.vote_count || '0';
+        const time = comment.created_time ? __formatUnixTs(comment.created_time) : '';
+
+        let md = `${indent}**${__mdEscape(author)}**`;
+        if (likeCount !== '0') md += ` (${likeCount}赞)`;
+        if (time) md += ` · ${time}`;
+        md += `\n${indent}${__mdEscape(content)}\n\n`;
+
+        return md;
     }
+
+    function __buildChildTree(childComments) {
+        // 简单返回子评论列表，不构建树结构
+        return childComments || [];
+    }
+
 
     function __commentsBlockMarkdown(roots) {
         if (!roots || roots.length === 0) return '';
@@ -675,7 +873,7 @@
             }
             window.scrollBy(0, Math.max(200, Math.floor(window.innerHeight * 0.9)));
             if (listContainer) {
-                try { listContainer.scrollTop = listContainer.scrollHeight; } catch(_) {}
+                try { listContainer.scrollTop = listContainer.scrollHeight; } catch (_) { }
             }
             const moreBtns = [
                 'button.ContentItem-more',
@@ -685,7 +883,7 @@
             ];
             for (const sel of moreBtns) {
                 const btn = document.querySelector(sel);
-                if (btn && btn.offsetParent !== null) { try { btn.click(); } catch(_) {} }
+                if (btn && btn.offsetParent !== null) { try { btn.click(); } catch (_) { } }
             }
             await new Promise(r => setTimeout(r, 800));
             const after = document.querySelectorAll('.AnswerItem').length;
@@ -768,6 +966,7 @@
                 if (answerId) {
                     const comments = await __fetchCommentsForAnswer(answerId);
                     chunks.push(__commentsBlockMarkdown(comments));
+                    closeCommentModal(); // 确保关闭弹窗
                 } else {
                     chunks.push('_（未能识别回答 ID，评论跳过）_\n\n');
                 }
@@ -856,6 +1055,7 @@
                 const comments = await __fetchCommentsForAnswer(token);
                 chunks.push(__commentsBlockMarkdown(comments));
                 chunks.push(`--- \n\n`);
+                closeCommentModal(); // 确保关闭弹窗
             }
             await yieldToBrowser(0);
         }
@@ -879,7 +1079,7 @@
     }
 
     // Add select button to answer
-    function addSelectButton(answerElement, __retry=0) {
+    function addSelectButton(answerElement, __retry = 0) {
         if (answerElement.dataset.__hasSelectButton === '1') return;
         if (answerElement.querySelector('.select-answer-button') || !answerElement.classList.contains('AnswerItem')) {
             return;
@@ -932,7 +1132,7 @@
 
         } else {
             if (__retry < 5) {
-                setTimeout(() => addSelectButton(answerElement, __retry+1), 200);
+                setTimeout(() => addSelectButton(answerElement, __retry + 1), 200);
             } else {
                 console.warn("meta not ready after retries", answerElement);
             }
@@ -1153,6 +1353,7 @@
 
     // Script Initialization
     console.log("Zhihu Download Script started.");
+    interceptXHRHeaders();
     __zudEnsurePanel();
 
     addDownloadAllButton();
