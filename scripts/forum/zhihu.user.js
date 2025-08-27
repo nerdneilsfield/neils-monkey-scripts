@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         知乎问题回答批量/选择性导出为 Markdown
 // @namespace    http://tampermonkey.net/
-// @version      0.8.1
+// @version      0.8.2
 // @description  在知乎问题页提供下载全部回答或选择部分回答导出为 Markdown 的功能
 // @author       Qi Deng
 // @match        https://www.zhihu.com/question/*
