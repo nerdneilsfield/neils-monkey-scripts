@@ -354,12 +354,17 @@
         await new Promise(r => setTimeout(r, 100 + Math.random() * 200));
 
         // 稍微往上滑一点
-        await smoothScrollTo(document.body.scrollHeight - 100, 300);
+        await smoothScrollTo(document.body.scrollHeight - 350, 500);
 
-        await new Promise(r => setTimeout(r, 100 + Math.random() * 200));
+        await new Promise(r => setTimeout(r, 2000 + Math.random() * 200));
 
         // 再滑到底部
         await smoothScrollTo(document.body.scrollHeight + 100, 300);
+
+        // 稍微往上滑一点
+        await smoothScrollTo(document.body.scrollHeight - 100, 300);
+
+        await new Promise(r => setTimeout(r, 500 + Math.random() * 200));
     }
 
     function smoothScrollTo(targetY, duration = 300) {
