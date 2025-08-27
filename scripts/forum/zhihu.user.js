@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         知乎问题回答批量/选择性导出为 Markdown
 // @namespace    http://tampermonkey.net/
-// @version      0.8.0
+// @version      0.8.1
 // @description  在知乎问题页提供下载全部回答或选择部分回答导出为 Markdown 的功能
 // @author       Qi Deng
 // @match        https://www.zhihu.com/question/*
@@ -13,6 +13,9 @@
 
 (function () {
     'use strict';
+
+    const DEFAULT_COMMENT_FETCH_TIMEOUT = 8000;
+    const RETRY_SCROLL_BOTTOM_TIMES = 15;
 
     // --- Turndown Configuration ---
     const turndownService = new TurndownService({
@@ -163,7 +166,8 @@
             });
 
             // Get actual answer count and set slider max
-            const headerText = document.querySelector('.List-headerText')?.innerText || '';
+            let headerText = document.querySelector('.List-headerText')?.innerText || '';
+            headerText = headerText.replace(',', '');
             const m = headerText.match(/(\d+)\s*个回答/);
             const total = m ? parseInt(m[1]) : 200;
 
@@ -270,6 +274,7 @@
         return m ? m[0].replace(/,/g, '') : '0';
     }
 
+
     function __getUpvoteCountFromAnswer(answerEl) {
         const voteBtn = answerEl.querySelector('button[aria-label*="赞同"], .VoteButton, .VoteButton--up');
         const raw = voteBtn?.getAttribute('aria-label') || voteBtn?.textContent || '';
@@ -308,6 +313,143 @@
         const token = author?.url_token;
         const url = token ? `https://www.zhihu.com/people/${token}` : '';
         return url ? `[${__mdEscape(name)}](${url})` : `**${__mdEscape(name)}**`;
+    }
+
+    async function humanLikeScrollToBottom() {
+        const startY = window.scrollY;
+        const targetY = document.body.scrollHeight;
+        const totalDistance = targetY - startY;
+
+        let currentY = startY;
+        const steps = 8 + Math.floor(Math.random() * 5); // 8-12步
+
+        for (let i = 0; i < steps; i++) {
+            // 计算每步的滑动距离（带随机性）
+            const baseStep = totalDistance / steps;
+            const randomVariation = (Math.random() - 0.5) * 0.3; // ±15%变化
+            const stepSize = baseStep * (1 + randomVariation);
+
+            currentY += stepSize;
+
+            // 偶尔回退一点（10%概率）
+            if (Math.random() < 0.1 && i > 2) {
+                const backtrack = stepSize * (0.1 + Math.random() * 0.2); // 回退10-30%
+                currentY -= backtrack;
+                await smoothScrollTo(currentY, 150 + Math.random() * 100);
+                await new Promise(r => setTimeout(r, 100 + Math.random() * 200));
+                currentY += backtrack; // 再滑回去
+            }
+
+            // 滑动到当前位置
+            await smoothScrollTo(currentY, 200 + Math.random() * 200);
+
+            // 随机停顿
+            const pauseTime = 50 + Math.random() * 150;
+            await new Promise(r => setTimeout(r, pauseTime));
+        }
+
+        // 最后确保到底部
+        await smoothScrollTo(document.body.scrollHeight + 100, 300);
+
+        await new Promise(r => setTimeout(r, 100 + Math.random() * 200));
+
+        // 稍微往上滑一点
+        await smoothScrollTo(document.body.scrollHeight - 100, 300);
+
+        await new Promise(r => setTimeout(r, 100 + Math.random() * 200));
+
+        // 再滑到底部
+        await smoothScrollTo(document.body.scrollHeight + 100, 300);
+    }
+
+    function smoothScrollTo(targetY, duration = 300) {
+        return new Promise(resolve => {
+            const startY = window.scrollY;
+            const distance = targetY - startY;
+            const startTime = performance.now();
+
+            function animate(currentTime) {
+                const elapsed = currentTime - startTime;
+                const progress = Math.min(elapsed / duration, 1);
+
+                // 使用easeInOutQuad缓动函数，更自然
+                const easeProgress = progress < 0.5
+                    ? 2 * progress * progress
+                    : -1 + (4 - 2 * progress) * progress;
+
+                const newY = startY + distance * easeProgress;
+                window.scrollTo(0, newY);
+
+                if (progress < 1) {
+                    requestAnimationFrame(animate);
+                } else {
+                    resolve();
+                }
+            }
+
+            requestAnimationFrame(animate);
+        });
+    }
+
+    async function humanLikeScrollContainerToBottom(container) {
+        const startY = container.scrollTop;
+        const maxScrollY = container.scrollHeight - container.clientHeight;
+        const totalDistance = maxScrollY - startY;
+
+        if (totalDistance <= 0) return;
+
+        let currentY = startY;
+        const steps = 6 + Math.floor(Math.random() * 4); // 6-9步
+
+        for (let i = 0; i < steps; i++) {
+            const baseStep = totalDistance / steps;
+            const randomVariation = (Math.random() - 0.5) * 0.4; // ±20%变化
+            const stepSize = baseStep * (1 + randomVariation);
+
+            currentY += stepSize;
+
+            // 偶尔回退（15%概率）
+            if (Math.random() < 0.15 && i > 1) {
+                const backtrack = stepSize * (0.15 + Math.random() * 0.25);
+                currentY -= backtrack;
+                await smoothScrollContainer(container, currentY, 120 + Math.random() * 80);
+                await new Promise(r => setTimeout(r, 80 + Math.random() * 120));
+                currentY += backtrack;
+            }
+
+            await smoothScrollContainer(container, currentY, 150 + Math.random() * 150);
+            await new Promise(r => setTimeout(r, 30 + Math.random() * 100));
+        }
+
+        // 确保到底部
+        await smoothScrollContainer(container, maxScrollY, 200);
+    }
+
+    function smoothScrollContainer(container, targetY, duration = 200) {
+        return new Promise(resolve => {
+            const startY = container.scrollTop;
+            const distance = targetY - startY;
+            const startTime = performance.now();
+
+            function animate(currentTime) {
+                const elapsed = currentTime - startTime;
+                const progress = Math.min(elapsed / duration, 1);
+
+                const easeProgress = progress < 0.5
+                    ? 2 * progress * progress
+                    : -1 + (4 - 2 * progress) * progress;
+
+                container.scrollTop = startY + distance * easeProgress;
+
+                if (progress < 1) {
+                    requestAnimationFrame(animate);
+                } else {
+                    resolve();
+                }
+            }
+
+            requestAnimationFrame(animate);
+        });
     }
 
     async function yieldToBrowser(ms = 0) {
@@ -413,15 +555,15 @@
             }
 
             // Scroll to bottom to trigger lazy loading
-            window.scrollTo(0, document.body.scrollHeight);
+            await humanLikeScrollToBottom();
 
             // Wait for new content to load
-            await new Promise(r => setTimeout(r, 2000));
+            await new Promise(r => setTimeout(r, DEFAULT_COMMENT_FETCH_TIMEOUT));
 
             const newCount = document.querySelectorAll('.AnswerItem').length;
             if (newCount === lastCount) {
                 stagnant++;
-                if (stagnant >= 10) {
+                if (stagnant >= RETRY_SCROLL_BOTTOM_TIMES) {
                     console.log(`No progress for ${stagnant} cycles, stopping at ${newCount}`);
                     break;
                 }
@@ -540,12 +682,12 @@
     // 替换原有的评论获取函数
     async function __fetchCommentsForAnswer(answerElOrId) {
         let answerEl, answerId;
-        
+
         // 参数处理保持不变
         if (typeof answerElOrId === 'string') {
             answerId = answerElOrId;
-            answerEl = document.querySelector(`[name="${answerId}"]`) || 
-                       document.querySelector(`[data-zop*="${answerId}"]`);
+            answerEl = document.querySelector(`[name="${answerId}"]`) ||
+                document.querySelector(`[data-zop*="${answerId}"]`);
             if (!answerEl) {
                 console.warn(`Cannot find answer element for ID: ${answerId}`);
                 return [];
@@ -557,55 +699,61 @@
             console.error('Invalid parameter for __fetchCommentsForAnswer:', answerElOrId);
             return [];
         }
-        
+
         try {
             const commentCount = __getCommentCountFromAnswer(answerEl);
             if (commentCount === '0') return [];
-            
+
             // 1. 点击评论按钮
             const commentBtn = answerEl.querySelector('.ContentItem-actions button:has(.Zi--Comment)');
             if (!commentBtn) return [];
-            
+
             commentBtn.click();
             await new Promise(r => setTimeout(r, 1500));
-            
+
             // 2. 检查是否有"查看全部"按钮
             const viewAllBtn = answerEl.querySelector('.css-vurnku');
             if (viewAllBtn && viewAllBtn.textContent.includes('查看全部')) {
                 // 有弹窗的情况
                 viewAllBtn.click();
                 await new Promise(r => setTimeout(r, 2000));
-                
+
+                console.log(`有嵌入式评论弹窗，打开获取.....${answerId}`);
+
                 const modalContent = document.querySelector('.Modal-content.css-1svde17');
                 if (modalContent) {
                     const scrollContainer = modalContent.querySelector('.css-34podr');
                     if (scrollContainer) {
                         let lastHeight = 0;
-                        for (let i = 0; i < 20; i++) {
-                            scrollContainer.scrollTop = scrollContainer.scrollHeight;
-                            await new Promise(r => setTimeout(r, 800));
+                        for (let i = 0; i < RETRY_SCROLL_BOTTOM_TIMES; i++) {
+                            // 人性化滑动到底部
+                            await humanLikeScrollContainerToBottom(scrollContainer);
+
+                            await new Promise(r => setTimeout(r, DEFAULT_COMMENT_FETCH_TIMEOUT));
                             if (scrollContainer.scrollHeight === lastHeight) break;
                             lastHeight = scrollContainer.scrollHeight;
                         }
-                        
+
                         const commentsList = modalContent.querySelector('.css-18ld3w0');
                         const comments = __extractCommentsFromPopup(commentsList);
                         closeCommentModal();
+                        console.log(`Found ${comments.length} comments for answer ${answerId}.`);
                         return comments;
                     }
                 }
             } else {
                 // 3. 没有"查看全部"按钮，从内嵌评论获取
+                console.log(`没有弹窗，直接从内嵌评论获取 ${answerId}.`);
                 const embeddedComments = answerEl.querySelector('.css-18ld3w0');
                 if (embeddedComments) {
                     const comments = __extractCommentsFromPopup(embeddedComments);
-                    console.log(`Found ${comments.length} embedded comments`);
+                    console.log(`Found ${comments.length} embedded comments for question answer ${answerId}.`);
                     return comments;
                 }
             }
-            
+
             return [];
-        } catch(e) {
+        } catch (e) {
             console.warn('Failed to get comments:', e);
             closeCommentModal();
             return [];
@@ -853,11 +1001,12 @@
     // Load all answers
     async function loadAllAnswers() {
         const headerSpan = document.querySelector('.List-headerText span');
-        const headerText = headerSpan?.innerText || '';
+        let headerText = headerSpan?.innerText || '';
+        headerText = headerText.replace(',', '');
         const totalAnswers = parseInt(headerText.match(/\d+/)?.[0]) || 999999;
         let lastCount = 0;
         let stagnant = 0;
-        const maxAttempts = 400;
+        const maxAttempts = 1000;
         const listContainer = document.getElementById('QuestionAnswers-answers');
 
         for (let attempt = 0; attempt < maxAttempts; attempt++) {
@@ -885,7 +1034,7 @@
                 const btn = document.querySelector(sel);
                 if (btn && btn.offsetParent !== null) { try { btn.click(); } catch (_) { } }
             }
-            await new Promise(r => setTimeout(r, 800));
+            await new Promise(r => setTimeout(r, DEFAULT_COMMENT_FETCH_TIMEOUT));
             const after = document.querySelectorAll('.AnswerItem').length;
             if (after === lastCount) {
                 stagnant++;
@@ -893,7 +1042,7 @@
                 stagnant = 0;
                 lastCount = after;
             }
-            if (stagnant >= 10) {
+            if (stagnant >= RETRY_SCROLL_BOTTOM_TIMES) {
                 console.log(`No progress after ${stagnant} idle cycles, stopping at ${after}/${totalAnswers}.`);
                 break;
             }
