@@ -81,9 +81,12 @@
     absolutize(url, baseHref = null) {
       try {
         if (!url) return url;
-        if (/^data:|^blob:/i.test(url)) return url;
-        const base = baseHref || U.$('base')?.href || location.href;
-        return new URL(url, base).toString();
+        if (/^(?:data|blob|https?):/i.test(url)) return url;
+        const origin = (typeof location !== 'undefined' && location.origin) ? location.origin : 'https://arxiv.org';
+        if (url.startsWith('/')) return origin + url;
+        const rawBase = baseHref || U.$('base')?.getAttribute?.('href') || (typeof location !== 'undefined' ? location.href : origin + '/');
+        const baseAbs = /^https?:\/\//i.test(rawBase) ? rawBase : (rawBase.startsWith('/') ? origin + rawBase : (typeof location !== 'undefined' ? location.href : origin + '/'));
+        return new URL(url, baseAbs).toString();
       } catch { return url; }
     },
     /** 从路径或<base>解析 arXiv id 与版本 */
@@ -332,9 +335,12 @@
       caption = caption ? caption.replace(/^\s*Figure\s+\d+\s*\.\s*/i, '').trim() : '';
 
       const img = this._$('img', fig);
-      if (img && img.getAttribute('src')) {
-        const src = this._abs(img.getAttribute('src'));
-        return { kind: 'img', src, caption, id };
+      if (img) {
+        const raw = img.getAttribute('src') || img.getAttribute('data-src') || null;
+        if (raw) {
+          const src = this._abs(raw);   // ★ 绝对化
+          return { kind: 'img', src, caption, id };
+        }
       }
       const svg = this._$('svg', fig);
       if (svg) {
@@ -554,8 +560,10 @@
     _abs(url) {
       try {
         if (!url) return url;
-        if (/^data:|^blob:/i.test(url)) return url;
-        const base = this.baseHref || (typeof location !== 'undefined' ? location.href : 'https://arxiv.org/');
+        if (/^(?:data|blob|https?):/i.test(url)) return url;
+        const origin = this._origin() || 'https://arxiv.org';
+        if (url.startsWith('/')) return origin + url;   // 站内绝对路径
+        const base = this._baseHref() || (typeof location !== 'undefined' ? location.href : origin + '/');
         return new URL(url, base).toString();
       } catch { return url; }
     }
@@ -574,7 +582,14 @@
 
     _baseHref() {
       const b = this._$('base');
-      return b ? (b.getAttribute('href') || '') : (typeof location !== 'undefined' ? location.href : '');
+      const raw = b ? (b.getAttribute('href') || '') : (typeof location !== 'undefined' ? location.href : '');
+      const origin = this._origin() || 'https://arxiv.org';
+
+      if (!raw) return (typeof location !== 'undefined' ? location.href : origin + '/');
+      if (/^https?:\/\//i.test(raw)) return raw;        // 已是绝对
+      if (raw.startsWith('/')) return origin + raw;     // 站内绝对路径 → 拼上 origin
+      try { return new URL(raw, (typeof location !== 'undefined' ? location.href : origin + '/')).toString(); }
+      catch { return (typeof location !== 'undefined' ? location.href : origin + '/'); }
     }
 
     _parseArxivIdVersion() {
@@ -1539,6 +1554,7 @@
       Log.info('Pipeline start:', mode);
 
       const meta = this.adapter.getMeta();
+      this._lastMeta = meta;
       const bib = this.adapter.collectBibliography();
       const citeMap = this.adapter.buildCitationMap(bib);
       const sections = this.adapter.walkSections();
@@ -1664,21 +1680,21 @@
     async exportLinks() {
       const md = await this.runPipeline('links');
       await (typeof GM_setClipboard === 'function' ? GM_setClipboard(md, { type: 'text' }) : Promise.resolve());
-      this._downloadText(md, this._suggestFileName('links.md'));
+      this._downloadText(md, this._suggestFileName('links', 'md'));     // ★ 改名
       alert('已生成 Links 版 Markdown。');
     }
 
     async exportBase64() {
       const md = await this.runPipeline('base64');
       const out = await this.exporter.asMarkdownBase64(md, this.assets.list());
-      this._downloadText(out, this._suggestFileName('base64.md'));
+      this._downloadText(out, this._suggestFileName('base64', 'md'));   // ★ 改名
       alert('已生成 Base64 版 Markdown。');
     }
 
     async exportTextBundle() {
       const md = await this.runPipeline('textbundle');
       const tb = await this.exporter.asTextBundle(md, this.assets.list());
-      this._downloadBlob(tb.blob, this._suggestFileName('export.textbundle'));
+      this._downloadBlob(tb.blob, this._suggestFileName('textbundle', 'textbundle')); // ★ 统一命名
       alert('已生成 TextBundle。');
     }
 
@@ -1813,11 +1829,26 @@
     }
 
     // —— 文件下载 —— //
-    _suggestFileName(suffix) {
-      const { id, version } = U.parseArxivIdVersion();
-      const safe = (s) => (s || '').replace(/[^\w.-]+/g, '_');
-      return `arxiv_${safe(id)}_${safe(version)}_${suffix}`;
+    _suggestFileName(tag, ext = 'md') {
+      const { id } = U.parseArxivIdVersion();
+      const rawTitle = (this._lastMeta?.title || document.title || 'untitled');
+
+      const safeId = String(id || 'unknown').replace(/[^\w.-]+/g, '_');
+
+      const safeTitle = String(rawTitle)
+        .normalize('NFKC')                      // 统一宽度形态
+        .replace(/\s+/g, '_')                   // 空格→下划线
+        .replace(/[<>:"/\\|?*\u0000-\u001F]/g, '') // 移除 Windows 不允许字符 & 控制符
+        .replace(/\.+$/g, '')                   // 去掉结尾的点（Windows 不允许）
+        .replace(/_{2,}/g, '_')                 // 合并多下划线
+        .replace(/^_+|_+$/g, '')                // 去掉首尾下划线
+        .slice(0, 120)                          // 控长度，避免过长文件名
+        || 'untitled';
+
+      const base = `arxiv_${safeId}_${safeTitle}_${tag}`;
+      return ext ? `${base}.${ext}` : base;
     }
+
     _downloadText(text, filename) {
       const blob = new Blob([text], { type: 'text/markdown;charset=utf-8' });
       this._downloadBlob(blob, filename);
@@ -1830,8 +1861,7 @@
       setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 0);
     }
   }
-  // -----------------------------
-  // 8) UI（悬浮面板 · arXiv 配色/可拖拽/预览）
+  // 8) UI（悬浮面板 · 懒加载预览）
   // -----------------------------
   const UI = {
     mount(controller) {
@@ -1840,26 +1870,13 @@
 
       GM_addStyle?.(`
       :root {
-        --ax-bg: #ffffff;
-        --ax-text: #111827;
-        --ax-muted: #6b7280;
-        --ax-border: #e5e7eb;
-        --ax-panel: rgba(255,255,255,0.96);
-        --ax-accent: #b31b1b;     /* arXiv Red */
-        --ax-accent-600: #971616; /* hover */
-        --ax-shadow: 0 12px 32px rgba(0,0,0,.15);
+        --ax-bg: #ffffff; --ax-text: #111827; --ax-muted: #6b7280;
+        --ax-border: #e5e7eb; --ax-panel: rgba(255,255,255,0.96);
+        --ax-accent: #b31b1b; --ax-accent-600: #971616; --ax-shadow: 0 12px 32px rgba(0,0,0,.15);
       }
       @media (prefers-color-scheme: dark) {
-        :root {
-          --ax-bg: #0f1115;
-          --ax-text: #e5e7eb;
-          --ax-muted: #9ca3af;
-          --ax-border: #30363d;
-          --ax-panel: rgba(17,17,17,.92);
-          --ax-accent: #cf3a3a;
-          --ax-accent-600: #b32f2f;
-          --ax-shadow: 0 16px 40px rgba(0,0,0,.4);
-        }
+        :root { --ax-bg:#0f1115; --ax-text:#e5e7eb; --ax-muted:#9ca3af; --ax-border:#30363d;
+                --ax-panel: rgba(17,17,17,.92); --ax-accent:#cf3a3a; --ax-accent-600:#b32f2f; --ax-shadow:0 16px 40px rgba(0,0,0,.4); }
       }
       .arxiv-md-panel {
         position: fixed; ${side === 'right' ? 'right: 16px;' : 'left: 16px;'}
@@ -1871,75 +1888,34 @@
         backdrop-filter: saturate(1.1) blur(6px);
         user-select: none;
       }
-      .arxiv-md-panel__head {
-        display: flex; align-items: center; justify-content: space-between; gap: 8px;
-        margin: 0 0 8px 0;
-      }
-      .arxiv-md-panel__title {
-        margin: 0; font-size: 13px; letter-spacing:.2px; font-weight: 700;
-        display: inline-flex; align-items: center; gap: 6px;
-      }
-      .arxiv-md-badge {
-        display:inline-block; padding:2px 6px; font-size:11px; font-weight:700;
-        color:#fff; background: var(--ax-accent); border-radius: 999px;
-      }
-      .arxiv-md-panel__drag {
-        cursor: grab; opacity: .9; font-size: 11px; color: var(--ax-muted);
-      }
-      .arxiv-md-panel__drag:active { cursor: grabbing; }
-      .arxiv-md-panel__btns { display:flex; flex-wrap: wrap; gap: 6px; }
-      .arxiv-md-btn {
-        margin: 0; padding: 6px 10px; border: 0; border-radius: 8px; cursor: pointer;
-        background: var(--ax-accent); color: #fff; font-weight: 700; font-size:12px;
-        box-shadow: 0 1px 0 rgba(0,0,0,.08);
-      }
-      .arxiv-md-btn:hover { background: var(--ax-accent-600); }
-      .arxiv-md-btn:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
-      .arxiv-md-btn--secondary {
-        background: transparent; color: var(--ax-text); border:1px solid var(--ax-border);
-      }
-      .arxiv-md-btn--secondary:hover {
-        background: rgba(0,0,0,.05);
-      }
-      .arxiv-md-btn--ghost {
-        background: transparent; color: var(--ax-muted);
-      }
-      .arxiv-md-btn--ghost:hover { color: var(--ax-text); }
+      .arxiv-md-panel__head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:0 0 8px 0}
+      .arxiv-md-panel__title{margin:0;font-size:13px;letter-spacing:.2px;font-weight:700;display:inline-flex;align-items:center;gap:6px}
+      .arxiv-md-badge{display:inline-block;padding:2px 6px;font-size:11px;font-weight:700;color:#fff;background:var(--ax-accent);border-radius:999px}
+      .arxiv-md-panel__drag{cursor:grab;opacity:.9;font-size:11px;color:var(--ax-muted)}
+      .arxiv-md-panel__drag:active{cursor:grabbing}
+      .arxiv-md-panel__btns{display:flex;flex-wrap:wrap;gap:6px}
+      .arxiv-md-btn{margin:0;padding:6px 10px;border:0;border-radius:8px;cursor:pointer;background:var(--ax-accent);color:#fff;font-weight:700;font-size:12px;box-shadow:0 1px 0 rgba(0,0,0,.08)}
+      .arxiv-md-btn:hover{background:var(--ax-accent-600)}
+      .arxiv-md-btn:focus-visible{outline:2px solid #fff;outline-offset:2px}
+      .arxiv-md-btn--secondary{background:transparent;color:var(--ax-text);border:1px solid var(--ax-border)}
+      .arxiv-md-btn--secondary:hover{background:rgba(0,0,0,.05)}
+      .arxiv-md-btn--ghost{background:transparent;color:var(--ax-muted)}
+      .arxiv-md-btn--ghost:hover{color:var(--ax-text)}
+      .arxiv-md-hide{display:none!important}
 
-      /* 预览层 */
-      .arxiv-md-overlay {
-        position: fixed; inset: 0; background: rgba(0,0,0,.35);
-        z-index: ${Z + 1}; display: none;
-      }
-      .arxiv-md-modal {
-        position: fixed; inset: 5% 8%;
-        background: var(--ax-bg); color: var(--ax-text);
-        border: 1px solid var(--ax-border); border-radius: 12px; box-shadow: var(--ax-shadow);
-        display: none; z-index: ${Z + 2}; overflow: hidden; display: flex; flex-direction: column;
-      }
-      .arxiv-md-modal__bar {
-        display:flex; justify-content: space-between; align-items: center; gap:8px;
-        padding: 10px 12px; border-bottom: 1px solid var(--ax-border);
-      }
-      .arxiv-md-modal__title { font-size: 13px; font-weight: 700; }
-      .arxiv-md-modal__tools { display:flex; gap:6px; align-items:center; }
-      .arxiv-md-modal__select { font-size: 12px; padding: 4px 6px; }
-      .arxiv-md-modal__body {
-        flex:1; overflow:auto; padding: 12px;
-        background: linear-gradient(180deg, rgba(0,0,0,.02), transparent 60%);
-      }
-      .arxiv-md-modal__pre {
-        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Microsoft Yahei Mono", monospace;
-        font-size: 12px; white-space: pre-wrap; word-break: break-word; line-height: 1.45;
-        padding: 12px; border: 1px dashed var(--ax-border); border-radius: 8px; background: #fff0;
-      }
-      @media (prefers-color-scheme: dark) {
-        .arxiv-md-modal__pre { background: rgba(255,255,255,.02); }
-      }
-      .arxiv-md-hide { display: none !important; }
+      /* 预览层（懒加载后才注入 DOM） */
+      .arxiv-md-overlay{position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:${Z + 1};display:none}
+      .arxiv-md-modal{position:fixed;inset:5% 8%;background:var(--ax-bg);color:var(--ax-text);border:1px solid var(--ax-border);border-radius:12px;box-shadow:var(--ax-shadow);display:none;z-index:${Z + 2};overflow:hidden;display:flex;flex-direction:column}
+      .arxiv-md-modal__bar{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid var(--ax-border)}
+      .arxiv-md-modal__title{font-size:13px;font-weight:700}
+      .arxiv-md-modal__tools{display:flex;gap:6px;align-items:center}
+      .arxiv-md-modal__select{font-size:12px;padding:4px 6px}
+      .arxiv-md-modal__body{flex:1;overflow:auto;padding:12px;background:linear-gradient(180deg,rgba(0,0,0,.02),transparent 60%)}
+      .arxiv-md-modal__pre{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Microsoft Yahei Mono",monospace;font-size:12px;white-space:pre-wrap;word-break:break-word;line-height:1.45;padding:12px;border:1px dashed var(--ax-border);border-radius:8px;background:#fff0}
+      @media (prefers-color-scheme: dark){.arxiv-md-modal__pre{background:rgba(255,255,255,.02)}}
     `);
 
-      // 面板 DOM
+      // 面板
       const panel = document.createElement('div');
       panel.className = 'arxiv-md-panel';
       panel.innerHTML = `
@@ -1958,42 +1934,16 @@
         <button class="arxiv-md-btn" data-action="base64">导出 · Base64</button>
         <button class="arxiv-md-btn arxiv-md-btn--secondary" data-action="textbundle">导出 · TextBundle</button>
       </div>
-`;
+    `;
       document.body.appendChild(panel);
 
-      // 预览层
-      const overlay = document.createElement('div');
-      overlay.className = 'arxiv-md-overlay';
-      const modal = document.createElement('div');
-      modal.className = 'arxiv-md-modal';
-      // （片段）预览层 HTML —— 让 Links 成为默认选中
-      modal.innerHTML = `
-<div class="arxiv-md-modal__bar">
-  <div class="arxiv-md-modal__title">Markdown 预览</div>
-  <div class="arxiv-md-modal__tools">
-    <select class="arxiv-md-modal__select" data-role="mode">
-      <option value="links" selected>Links</option>
-      <option value="base64">Base64</option>
-    </select>
-    <button class="arxiv-md-btn arxiv-md-btn--secondary" data-action="copy">复制</button>
-    <button class="arxiv-md-btn" data-action="download">下载 .md</button>
-    <button class="arxiv-md-btn arxiv-md-btn--ghost" data-action="close">关闭</button>
-  </div>
-</div>
-<div class="arxiv-md-modal__body">
-  <pre class="arxiv-md-modal__pre" data-role="content">加载中...</pre>
-</div>
-`;
-      document.body.appendChild(overlay);
-      document.body.appendChild(modal);
-
-      // —— 折叠 —— //
+      // 折叠
       const btns = panel.querySelector('[data-role="buttons"]');
       panel.querySelector('[data-action="toggle"]')?.addEventListener('click', () => {
         btns.classList.toggle('arxiv-md-hide');
       });
 
-      // —— 按钮事件 —— //
+      // 按钮事件（预览为懒加载）
       panel.addEventListener('click', async (e) => {
         const btn = e.target;
         if (!(btn instanceof HTMLButtonElement)) return;
@@ -2005,6 +1955,7 @@
           if (act === 'preview') {
             const mode = btn.getAttribute('data-mode') || 'links';
             const md = await UI._genMarkdownForPreview(controller, mode);
+            const { overlay, modal } = UI._ensurePreview();   // ★ 懒加载
             UI._openPreview(modal, overlay, md, mode, controller);
           }
         } catch (err) {
@@ -2013,7 +1964,72 @@
         }
       });
 
-      // —— 预览层事件 —— //
+      // 拖拽与位置持久化
+      const dragHandle = panel.querySelector('.arxiv-md-panel__drag');
+      let dragging = false, sx = 0, sy = 0, startRect = null;
+      const saved = UI._loadPos();
+      if (saved) {
+        panel.style.left = saved.left != null ? `${saved.left}px` : '';
+        panel.style.right = saved.right != null ? `${saved.right}px` : '';
+        panel.style.top = saved.top != null ? `${saved.top}px` : '';
+        panel.style.bottom = saved.bottom != null ? `${saved.bottom}px` : '';
+      }
+      const onMove = (ev) => {
+        if (!dragging) return;
+        const dx = ev.clientX - sx; const dy = ev.clientY - sy;
+        let left = startRect.left + dx; let top = startRect.top + dy;
+        left = Math.max(8, Math.min(window.innerWidth - startRect.width - 8, left));
+        top = Math.max(8, Math.min(window.innerHeight - startRect.height - 8, top));
+        panel.style.left = `${Math.round(left)}px`;
+        panel.style.right = '';
+        panel.style.top = `${Math.round(top)}px`;
+        panel.style.bottom = '';
+      };
+      const onUp = () => {
+        if (!dragging) return;
+        dragging = false;
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+        UI._savePos(panel);
+      };
+      dragHandle?.addEventListener('mousedown', (ev) => {
+        dragging = true; sx = ev.clientX; sy = ev.clientY; startRect = panel.getBoundingClientRect();
+        document.addEventListener('mousemove', onMove);
+        document.addEventListener('mouseup', onUp);
+      });
+    },
+
+    // 懒加载预览 DOM（只在点击预览时创建）
+    _ensurePreview() {
+      let overlay = document.querySelector('.arxiv-md-overlay');
+      let modal = document.querySelector('.arxiv-md-modal');
+      if (overlay && modal) return { overlay, modal };
+
+      overlay = document.createElement('div');
+      overlay.className = 'arxiv-md-overlay';
+      modal = document.createElement('div');
+      modal.className = 'arxiv-md-modal';
+      modal.innerHTML = `
+      <div class="arxiv-md-modal__bar">
+        <div class="arxiv-md-modal__title">Markdown 预览</div>
+        <div class="arxiv-md-modal__tools">
+          <select class="arxiv-md-modal__select" data-role="mode">
+            <option value="links" selected>Links</option>
+            <option value="base64">Base64</option>
+          </select>
+          <button class="arxiv-md-btn arxiv-md-btn--secondary" data-action="copy">复制</button>
+          <button class="arxiv-md-btn" data-action="download">下载 .md</button>
+          <button class="arxiv-md-btn arxiv-md-btn--ghost" data-action="close">关闭</button>
+        </div>
+      </div>
+      <div class="arxiv-md-modal__body">
+        <pre class="arxiv-md-modal__pre" data-role="content">加载中...</pre>
+      </div>
+    `;
+      document.body.appendChild(overlay);
+      document.body.appendChild(modal);
+
+      // 事件仅在首次创建时绑定
       overlay.addEventListener('click', () => UI._closePreview(modal, overlay));
       modal.addEventListener('click', async (e) => {
         const el = e.target;
@@ -2035,67 +2051,26 @@
       });
       modal.querySelector('[data-role="mode"]')?.addEventListener('change', async (e) => {
         const mode = e.target.value;
-        const md = await UI._genMarkdownForPreview(controller, mode);
+        const md = await UI._genMarkdownForPreview(window.__AX_CTRL__, mode);
         const pre = modal.querySelector('[data-role="content"]');
         pre.textContent = md;
       });
 
-      // —— 拖拽 & 位置持久化 —— //
-      const dragHandle = panel.querySelector('.arxiv-md-panel__drag');
-      let dragging = false, sx = 0, sy = 0, startRect = null;
-
-      // 读取持久化位置
-      const saved = UI._loadPos();
-      if (saved) {
-        panel.style.left = saved.left != null ? `${saved.left}px` : '';
-        panel.style.right = saved.right != null ? `${saved.right}px` : '';
-        panel.style.top = saved.top != null ? `${saved.top}px` : '';
-        panel.style.bottom = saved.bottom != null ? `${saved.bottom}px` : '';
-      }
-
-      dragHandle?.addEventListener('mousedown', (ev) => {
-        dragging = true; sx = ev.clientX; sy = ev.clientY; startRect = panel.getBoundingClientRect();
-        document.addEventListener('mousemove', onMove);
-        document.addEventListener('mouseup', onUp);
-      });
-      const onMove = (ev) => {
-        if (!dragging) return;
-        const dx = ev.clientX - sx; const dy = ev.clientY - sy;
-        let left = startRect.left + dx;
-        let top = startRect.top + dy;
-        left = Math.max(8, Math.min(window.innerWidth - startRect.width - 8, left));
-        top = Math.max(8, Math.min(window.innerHeight - startRect.height - 8, top));
-        panel.style.left = `${Math.round(left)}px`;
-        panel.style.right = '';
-        panel.style.top = `${Math.round(top)}px`;
-        panel.style.bottom = '';
-      };
-      const onUp = () => {
-        if (!dragging) return;
-        dragging = false;
-        document.removeEventListener('mousemove', onMove);
-        document.removeEventListener('mouseup', onUp);
-        UI._savePos(panel);
-      };
+      return { overlay, modal };
     },
 
     async _genMarkdownForPreview(controller, mode) {
       const md = await controller.runPipeline(mode);
-      if (mode === 'base64') {
-        // 再跑一遍替换 assets 路径为 dataURL
-        return await controller.exporter.asMarkdownBase64(md, controller.assets.list());
-      }
+      if (mode === 'base64') return await controller.exporter.asMarkdownBase64(md, controller.assets.list());
       return md;
     },
 
-    // （片段）打开预览时的默认模式 —— 未指定则回落到 'links'
-    _openPreview(modal, overlay, md, mode, controller) {
+    _openPreview(modal, overlay, md, mode) {
       const select = modal.querySelector('[data-role="mode"]');
-      const useMode = mode || 'links';                   // ★ 强制默认 Links
-      if (select) select.value = useMode;               // UI 下拉同步
+      const useMode = mode || 'links';
+      if (select) select.value = useMode;
       modal.querySelector('[data-role="content"]').textContent = md || '';
-      overlay.style.display = 'block';
-      modal.style.display = 'flex';
+      overlay.style.display = 'block'; modal.style.display = 'flex';
     },
     _closePreview(modal, overlay) {
       overlay.style.display = 'none'; modal.style.display = 'none';
@@ -2103,8 +2078,7 @@
 
     _savePos(panel) {
       const r = panel.getBoundingClientRect();
-      const pos = { left: Math.round(r.left), top: Math.round(r.top) };
-      localStorage.setItem('axmd.panel.pos', JSON.stringify(pos));
+      localStorage.setItem('axmd.panel.pos', JSON.stringify({ left: Math.round(r.left), top: Math.round(r.top) }));
     },
     _loadPos() {
       try { return JSON.parse(localStorage.getItem('axmd.panel.pos') || 'null'); } catch { return null; }
@@ -2112,7 +2086,7 @@
   };
 
   // -----------------------------
-  // 9) Boot（保持 arXiv HTML 匹配，优化日志提示）
+  // 9) Boot（不做任何预览调用）
   // -----------------------------
   function boot() {
     try {
@@ -2122,10 +2096,10 @@
         return;
       }
       const ctrl = new Controller();
+      // 供懒加载预览的 change 事件访问
+      window.__AX_CTRL__ = ctrl; // 可选：若不喜欢全局可改闭包
       UI.mount(ctrl);
-      (typeof Log !== 'undefined' ? Log : console).info(
-        `[${(typeof Config !== 'undefined' ? Config.APP_NAME : 'arXiv → Markdown')}] UI mounted`
-      );
+      (typeof Log !== 'undefined' ? Log : console).info(`[${(typeof Config !== 'undefined' ? Config.APP_NAME : 'arXiv → Markdown')}] UI mounted`);
     } catch (err) {
       (typeof Log !== 'undefined' ? Log : console).error('Boot error:', err);
     }
