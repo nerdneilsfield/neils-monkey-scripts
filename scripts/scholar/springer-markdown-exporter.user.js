@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Springer Chapter to Markdown Exporter (Framework)
 // @namespace    http://tampermonkey.net/
-// @version      0.1.0
+// @version      1.0.0
 // @description  Export SpringerLink chapter pages to Markdown (Links/Base64/TextBundle) — Framework Only
 // @author       qiqi
 // @match        https://link.springer.com/chapter/*
@@ -268,16 +268,20 @@
          */
         async extractFigure(fig) {
             if (!fig) return null;
+
+            // 表样式 figure —— 不当图处理，留给 extractTable
+            if (this.isTableLikeFigure(fig)) return null;
+
             const id = fig.getAttribute('id') || null;
 
-            // —— 1) 主文标题：<figcaption><b>Fig. N.</b> + .c-article-section__figure-description —— //
+            // 标题：<figcaption><b>Fig. N.</b> + 下方描述
             const labelEl = fig.querySelector('figcaption b.c-article-section__figure-caption,[data-test="figure-caption-text"]');
-            const label = labelEl ? (labelEl.textContent || '').trim().replace(/\s+/g, ' ') : ''; // "Fig. 1."
+            const label = labelEl ? (labelEl.textContent || '').trim().replace(/\s+/g, ' ') : '';
             const descEl = fig.querySelector('.c-article-section__figure-description,[data-test="bottom-caption"]');
             const desc = descEl ? U.mergeSoftWraps(descEl.textContent || '') : '';
-            let caption = this._cleanCaption(label, desc);
+            let caption = this._cleanCaption ? this._cleanCaption(label, desc) : `${label}${label && desc ? ' ' : ''}${desc}`;
 
-            // —— 2) 主文图片：<img> / <source srcset> —— //
+            // inline <img> / <source srcset>
             const inlineImg = fig.querySelector('img, picture source[srcset]');
             const inlinePick = inlineImg
                 ? (inlineImg.tagName.toLowerCase() === 'img'
@@ -286,24 +290,23 @@
                 : null;
             const inlineUrl = inlinePick ? U.absolutize(inlinePick, this.baseHref) : null;
 
-            // —— 3) 二跳链接：a[data-test="img-link"] / a[href*="/figures/"]（优先 /full/）—— //
+            // “Full size image” → /figures/{n}
             const jumpA = fig.querySelector('a[data-test="img-link"], a[aria-label^="Full size image"], a[href*="/figures/"]');
             if (jumpA) {
-                const satURL = U.absolutize(jumpA.getAttribute('href') || '', this.baseHref);
-                const sat = await this._getSatelliteFigureDataWithRetry(satURL, 3);
+                const url = U.absolutize(jumpA.getAttribute('href') || '', this.baseHref);
+                const sat = await (this._getSatelliteFigureDataWithRetry ? this._getSatelliteFigureDataWithRetry(url, 3) : null);
                 if (sat?.src) {
-                    // 标题优先用卫星页组合（h1 + bottom-caption）
                     caption = sat.caption || caption;
                     return { kind: 'img', src: sat.src, caption, id };
                 }
             }
 
-            // —— 4) 无二跳或失败 → 用主文图 —— //
+            // 用主文图
             if (inlineUrl) return { kind: 'img', src: inlineUrl, caption, id };
 
-            // —— 5) inline SVG 兜底 —— //
+            // inline SVG（排除UI小图标）
             const svg = fig.querySelector('svg');
-            if (svg) return { kind: 'svg', inlineSvg: svg.outerHTML, caption, id };
+            if (svg && !this.isSvgIcon(svg)) return { kind: 'svg', inlineSvg: svg.outerHTML, caption, id };
 
             return null;
         }
@@ -314,31 +317,42 @@
         async extractTable(root) {
             if (!root) return { html: '' };
 
-            // —— 1) 找“Full size table”跳转 —— //
-            const link = root.querySelector('a[data-test="table-link"], a[aria-label^="Full size table"], a[href*="/tables/"]');
-            if (link) {
-                const url = U.absolutize(link.getAttribute('href') || '', this.baseHref);
-                const sat = await this._getSatelliteTableDataWithRetry(url, 3);
+            // 1) 优先：Full size table 链接 → 卫星页
+            const tlink = this._selectTableLinkFromNode(root);
+            if (tlink) {
+                const sat = await (this._getSatelliteTableDataWithRetry ? this._getSatelliteTableDataWithRetry(tlink, 3) : null);
                 if (sat?.tableHtml) {
                     const titleHtml = sat.title ? `<div class="table-caption">${U.mergeSoftWraps(sat.title)}</div>\n` : '';
-                    return { html: `${titleHtml}${sat.tableHtml}` }; // 复杂表直接内嵌
+                    return { html: `${titleHtml}${sat.tableHtml}` };
                 }
-                // 卫星页没取到表：返回明确占位，避免误混正文段落
-                return { html: `<div class="table-caption">${U.mergeSoftWraps(sat?.title || 'Table')}</div>\n<p><a href="${url}" target="_blank" rel="noopener">Open full size table</a></p>` };
+                return { html: `<p><a href="${tlink}" target="_blank" rel="noopener">Open full size table</a></p>` };
             }
 
-            // —— 2) 主文若真的内嵌了 <table>（少见）—— //
-            const table = root.tagName.toLowerCase() === 'table' ? root : root.querySelector('table');
+            // 2) 主文若真的内嵌了 <table>
+            const table = root.tagName.toLowerCase() === 'table' ? root : root.querySelector?.('table');
             if (table) {
                 const hasSpan = !!table.querySelector('[rowspan],[colspan]');
-                if (hasSpan) return { html: table.outerHTML };           // 复杂表：内嵌 HTML
-                return this._tableToMatrix(table);                       // 简单表：转 Markdown 网格
+                if (hasSpan || (Config.TABLES?.downcast === 'html')) return { html: table.outerHTML };
+                return this._tableToMatrix(table);
             }
 
-            // —— 3) 全无：保留占位，指向原处 —— //
-            return { html: `<p><a href="${location.href}#${root.id || ''}">Table not found (try opening Full size table)</a></p>` };
-        }
+            // 3) 若传进来的是“表样式 figure”但暂时没有链接，尝试从父容器找链接
+            if (root.tagName && root.tagName.toLowerCase() === 'figure' && this.isTableLikeFigure(root)) {
+                const parent = root.closest('.c-article-table,[data-container-section="table"]') || root.parentElement;
+                const link2 = parent ? this._selectTableLinkFromNode(parent) : null;
+                if (link2) {
+                    const sat = await (this._getSatelliteTableDataWithRetry ? this._getSatelliteTableDataWithRetry(link2, 3) : null);
+                    if (sat?.tableHtml) {
+                        const titleHtml = sat.title ? `<div class="table-caption">${U.mergeSoftWraps(sat.title)}</div>\n` : '';
+                        return { html: `${titleHtml}${sat.tableHtml}` };
+                    }
+                    return { html: `<p><a href="${link2}" target="_blank" rel="noopener">Open full size table</a></p>` };
+                }
+            }
 
+            // 4) 兜底占位
+            return { html: `<p>Table not found. Please open the full size table on Springer.</p>` };
+        }
         extractFootnote(node) {
             // Springer 结构化脚注较少，这里保持接口
             if (!node) return null;
@@ -348,6 +362,40 @@
             const key = id ? `F_${id}` : null;
             if (!key) return null;
             return { key, content };
+        }
+
+        // —— 判定：这是表容器吗？（主文）——
+        isTableContainer(node) {
+            if (!node || !node.matches) return false;
+            return node.matches('.c-article-table, [data-container-section="table"]');
+        }
+
+        // —— 判定：这是“表样式 figure”吗？（figure 外形，但其实是表的壳）——
+        isTableLikeFigure(fig) {
+            if (!fig) return false;
+            if (fig.closest && fig.closest('.c-article-table')) return true;
+            if (fig.querySelector && (
+                fig.querySelector('[data-test="table-caption"], .c-article-table__figcaption') ||
+                fig.querySelector('a[data-test="table-link"], a[aria-label^="Full size table"], a[href*="/tables/"]') ||
+                fig.querySelector('table')
+            )) return true;
+            return false;
+        }
+
+        // —— 小图标 svg？（u-icon 或极小尺寸）——
+        isSvgIcon(svgEl) {
+            if (!svgEl) return false;
+            if (svgEl.closest && svgEl.closest('.u-icon')) return true;
+            const w = parseInt(svgEl.getAttribute('width') || '0', 10) || 0;
+            const h = parseInt(svgEl.getAttribute('height') || '0', 10) || 0;
+            return (w && h && (w <= 32 || h <= 32));
+        }
+
+        // —— 从节点里挑 “Full size table” 链接 —— 
+        _selectTableLinkFromNode(root) {
+            if (!root?.querySelector) return null;
+            const a = root.querySelector('a[data-test="table-link"], a[aria-label^="Full size table"], a[href*="/tables/"]');
+            return a ? U.absolutize(a.getAttribute('href') || '', this.baseHref) : null;
         }
 
         // ===== Internals =====
@@ -1001,6 +1049,10 @@
             ].join('\n');
         }
 
+        reset() {
+            this.buffers = { head: [], body: [], footnotes: [], references: [] };
+        }
+
         _ensureBlockGap() {
             const body = this.buffers?.body;
             if (!body || !body.length) return;
@@ -1030,25 +1082,37 @@
         async fetchRaster(url) {
             try {
                 if (!url) return { path: url };
+                // data: 情况直接注册
                 if (/^data:/i.test(url)) {
                     const parsed = this._dataUrlToBlob(url);
                     const name = this._uniqueName(this._filenameFromURL('image'), this._extFromMime(parsed.type));
                     const assetPath = `assets/${name}`;
-                    this._registerAsset({ name, blob: parsed.blob, mime: parsed.type, path: assetPath, dataURL: url });
-                    return { path: url, assetPath, name, mime: parsed.type, bytes: parsed.blob.size };
+                    this._registerAsset({ name, blob: parsed.blob, mime: parsed.type, path: assetPath, originalUrl: null, dataURL: url });
+                    return { path: assetPath, assetPath, name, mime: parsed.type, bytes: parsed.blob.size, originalUrl: null };
                 }
+
+                // 远程抓取
                 const blob = await this._getBlob(url);
-                if (!blob) return { path: url };
+                if (!blob) return { path: url, originalUrl: url };
+
                 const scaled = await this._maybeScale(blob, { maxDim: this.cfg.IMAGES.maxDim, maxBytes: this.cfg.IMAGES.maxBytes });
                 const outBlob = scaled.blob;
                 const mime = outBlob.type || 'image/png';
                 const name = this._uniqueName(this._filenameFromURL(url), this._extFromMime(mime));
                 const assetPath = `assets/${name}`;
-                this._registerAsset({ name, blob: outBlob, mime, path: assetPath });
-                return { path: url, assetPath, name, mime, bytes: outBlob.size, width: scaled.width, height: scaled.height };
+
+                this._registerAsset({ name, blob: outBlob, mime, path: assetPath, originalUrl: url });
+                return {
+                    path: assetPath,          // 统一返回 assetPath，后续 Markdown 用它
+                    assetPath,
+                    name, mime,
+                    bytes: outBlob.size,
+                    width: scaled.width, height: scaled.height,
+                    originalUrl: url
+                };
             } catch (err) {
                 Log.warn('AssetsManager.fetchRaster error:', err);
-                return { path: url };
+                return { path: url, originalUrl: url };
             }
         }
 
@@ -1228,21 +1292,55 @@
             const list = await this._resolveAssets(assets);
             if (!list.length) return md;
 
-            const path2data = new Map();
+            // 预生成 dataURL
+            const records = [];
             for (const a of list) {
-                const p = a.path || (a.name ? `assets/${a.name}` : null);
-                if (!p) continue;
-                const dataURL = a.dataURL || (a.blob ? await this._blobToDataURL(a.blob) : null);
+                let dataURL = a.dataURL;
+                if (!dataURL && a.blob instanceof Blob) dataURL = await this._blobToDataURL(a.blob);
                 if (!dataURL) continue;
-                path2data.set(p, dataURL);
-                path2data.set(`./${p}`, dataURL);
-                path2data.set(`/${p}`, dataURL);
+
+                const paths = new Set();
+                // 资产路径（TextBundle/Links 模式下使用）
+                if (a.path) {
+                    paths.add(a.path);
+                    paths.add(`./${a.path}`);
+                    paths.add(`/${a.path}`);
+                }
+                // 原始 URL（Links 模式或某些意外路径）
+                if (a.originalUrl) {
+                    paths.add(a.originalUrl);
+                    // 有些页面会加协议相对、或 URL 编码差异，这里补一个协议相对匹配
+                    if (/^https?:\/\//i.test(a.originalUrl)) {
+                        const protoRel = a.originalUrl.replace(/^https?:/, '');
+                        paths.add(protoRel);
+                    }
+                }
+                records.push({ paths: Array.from(paths), dataURL });
             }
 
-            for (const [p, durl] of path2data.entries()) {
-                md = md.replace(new RegExp(`\\((\\s*?)${this._escReg(p)}(\\s*?)\\)`, 'g'), (_m, a, b) => `(${a}${durl}${b})`);
-                md = md.replace(new RegExp(`(src|href)=(")${this._escReg(p)}(")`, 'g'), (_m, k, q1, q2) => `${k}=${q1}${durl}${q2}`);
-                md = md.replace(new RegExp(`(src|href)=(')${this._escReg(p)}(')`, 'g'), (_m, k, q1, q2) => `${k}=${q1}${durl}${q2}`);
+            // 替换函数（() 链接；HTML 的 src|href；以及 srcset 内的 URL）
+            const replaceOne = (text, from, to) => {
+                const esc = from.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                // Markdown/HTML () 链接
+                text = text.replace(new RegExp(`\\((\\s*?)${esc}(\\s*?)\\)`, 'g'), (_m, a, b) => `(${a}${to}${b})`);
+                // HTML 属性 src/href
+                text = text.replace(new RegExp(`(src|href)=(")${esc}(")`, 'g'), (_m, k, q1, q2) => `${k}=${q1}${to}${q2}`);
+                text = text.replace(new RegExp(`(src|href)=(')${esc}(')`, 'g'), (_m, k, q1, q2) => `${k}=${q1}${to}${q2}`);
+                // srcset（用空格或逗号分隔的一串 URL + 尺寸；逐个替换 URL）
+                text = text.replace(new RegExp(`(srcset=)("([^"]*)")`, 'g'), (_m, attr, quoted, inner) => {
+                    const replaced = inner.split(',').map(seg => {
+                        const parts = seg.trim().split(/\s+/);
+                        if (!parts.length) return seg;
+                        if (parts[0] === from) parts[0] = to;
+                        return parts.join(' ');
+                    }).join(', ');
+                    return `${attr}"${replaced}"`;
+                });
+                return text;
+            };
+
+            for (const rec of records) {
+                for (const p of rec.paths) md = replaceOne(md, p, rec.dataURL);
             }
             return md;
         }
@@ -1255,6 +1353,7 @@
             files.push({ name: 'text.md', data: textMd });
             files.push({ name: 'info.json', data: infoJson });
 
+            // 打包资产
             const list = await this._resolveAssets(assets);
             for (const a of list) {
                 if (!a?.blob || !a?.name) continue;
@@ -1262,11 +1361,69 @@
                 files.push({ name: `assets/${a.name}`, data });
             }
 
+            // 诊断：扫描 markdown 中未打包的外链资源
+            const diag = this._diagnoseExternalResources(String(markdown || ''));
+            if (diag.external.length) {
+                const report = this._buildDiagnosticsReport(diag, list);
+                files.push({ name: 'diagnostics.txt', data: this._utf8(report) });
+            }
+
             const zipBlob = await this._zip(files);
-            return { filename: 'export.textbundle', blob: zipBlob };
+            return { filename: 'export.textbundle', blob: zipBlob, diagnostics: diag, external_count: diag.external.length };
         }
 
         // internals
+
+        _diagnoseExternalResources(md) {
+            const externals = new Set();
+
+            const addIfExternal = (u) => {
+                if (!u) return;
+                const s = String(u).trim();
+                // 忽略 data:, mailto:, 相对/本地 assets
+                if (/^(data:|mailto:)/i.test(s)) return;
+                if (/^(?:https?:)?\/\//i.test(s)) { externals.add(s.startsWith('//') ? ('https:' + s) : s); return; }
+            };
+
+            // 1) Markdown 图片：![alt](URL)
+            const mdImg = /!\[[^\]]*\]\(([^)]+)\)/g;
+            for (let m; (m = mdImg.exec(md));) addIfExternal(m[1]);
+
+            // 2) HTML src/href
+            const htmlSrc = /(src|href)=["']([^"']+)["']/gi;
+            for (let m; (m = htmlSrc.exec(md));) addIfExternal(m[2]);
+
+            // 3) srcset（逗号分隔）
+            const srcset = /srcset=["']([^"']+)["']/gi;
+            for (let m; (m = srcset.exec(md));) {
+                const inner = m[1].split(',').map(s => s.trim().split(/\s+/)[0]).filter(Boolean);
+                inner.forEach(addIfExternal);
+            }
+
+            return { external: Array.from(externals).sort() };
+        }
+
+        // Exporter._buildDiagnosticsReport —— 新增
+        _buildDiagnosticsReport(diag, assetList) {
+            const lines = [];
+            lines.push('Springer → Markdown · TextBundle Diagnostics');
+            lines.push('===========================================');
+            lines.push('');
+            lines.push(`Unpacked external resources: ${diag.external.length}`);
+            for (const url of diag.external) lines.push(`- ${url}`);
+            lines.push('');
+            lines.push(`Packed assets: ${Array.isArray(assetList) ? assetList.length : 0}`);
+            if (Array.isArray(assetList)) {
+                for (const a of assetList) {
+                    const sz = (a?.blob?.size ?? 0);
+                    lines.push(`- assets/${a.name} (${sz} bytes${a.originalUrl ? `; from ${a.originalUrl}` : ''})`);
+                }
+            }
+            lines.push('');
+            lines.push('Hint: 若仍有外链，说明对应资源未成功抓取或某些路径未被替换（如直接写死 https://media.springernature.com/...）。请检查提到的 URL，并确认在 textbundle 模式下对图片统一使用 AssetsManager.fetchRaster 的返回路径。');
+            return lines.join('\n');
+        }
+
         async _resolveAssets(assetsMaybe) {
             if (Array.isArray(assetsMaybe)) return assetsMaybe;
             if (this._assetsProvider) {
@@ -1375,18 +1532,19 @@
         }
 
         async runPipeline(mode = 'links') {
+            this._prepareRun(mode);   // ← 关键：每次运行先清空
             Log.info('Pipeline start:', mode);
 
             const meta = this.adapter.getMeta();
             this._lastMeta = meta;
 
-            // References 侧边栏可能异步渲染，要 await
+
             const bib = await this.adapter.collectBibliography();
             const citeMap = this.adapter.buildCitationMap(bib);
 
             const sections = this.adapter.walkSections();
             this._cited = new Set();
-            const footF = []; // 如有正文脚注(F*)可 push 到这里
+            const footF = [];
 
             this.emitter.emitFrontMatter(meta);
             this.emitter.emitTOCPlaceholder();
@@ -1395,39 +1553,54 @@
                 this.emitter.emitHeading(sec.level || 2, sec.title || 'Section', sec.anchor);
 
                 for (const node of (sec.nodes || [])) {
-                    const tag = node.tagName?.toLowerCase();
+                    const tag = (node.tagName || '').toLowerCase();
 
+                    // —— 段落（含行内TeX、脚注、行内格式保留、去掉UI图标）——
                     if (tag === 'p') {
                         const text = this._renderParagraphWithCites(node, citeMap);
                         this.emitter.emitParagraph(text);
                         continue;
                     }
 
-                    // 方程块（Springer: div.c-article-equation + MathJax-TeX）
+                    // —— 方程块（块级TeX）——
                     if (tag === 'div' && node.classList.contains('c-article-equation')) {
                         const em = this.adapter.extractEquationBlock(node);
                         if (em) this.emitter.emitMath(em);
                         continue;
                     }
-
                     if (tag === 'math') {
                         const m = this.adapter.extractMath(node);
                         if (m) this.emitter.emitMath(m);
                         continue;
                     }
 
-                    if (tag === 'figure') {
+                    // —— 表：优先识别（容器 + 表样式figure）——
+                    if (
+                        (node.matches && (this.adapter.isTableContainer(node) || this.adapter.isTableLikeFigure(node))) ||
+                        tag === 'table'
+                    ) {
+                        const t = await this.adapter.extractTable(node);
+                        this.emitter.emitTable(t);
+                        continue;
+                    }
+
+                    // —— 纯图片 figure（排除表样式figure）——
+                    if (tag === 'figure' && !(this.adapter.isTableLikeFigure(node))) {
                         const fig = await this.adapter.extractFigure(node);
-                        if (!fig) continue;
-                        if (fig.kind === 'img') {
+                        if (!fig) { /* 若为空说明不是有效图，继续看其它分支 */ }
+                        else if (fig.kind === 'img') {
                             if (mode === 'links') {
                                 this.emitter.emitFigure({ kind: 'img', path: fig.src || fig.path, caption: fig.caption });
                             } else {
                                 const r = await this.assets.fetchRaster(fig.src || fig.path);
                                 this.emitter.emitFigure({ kind: 'img', path: r.assetPath || r.path, caption: fig.caption });
                             }
+                            continue;
                         } else if (fig.kind === 'svg') {
-                            if (mode === 'textbundle') {
+                            // 过滤掉 UI 小图标（已在 adapter 侧尽量避免，这里再兜底）
+                            if (fig.inlineSvg && /class="u-icon"|xlink:href="#icon-eds-/i.test(fig.inlineSvg)) {
+                                // 丢弃
+                            } else if (mode === 'textbundle') {
                                 let svgEl = null;
                                 try {
                                     if (fig.inlineSvg) svgEl = new DOMParser().parseFromString(fig.inlineSvg, 'image/svg+xml').documentElement;
@@ -1438,33 +1611,27 @@
                             } else {
                                 this.emitter.emitFigure({ kind: 'svg', inlineSvg: fig.inlineSvg, caption: fig.caption });
                             }
+                            continue;
                         }
-                        continue;
+                        // 若 fig == null（如被识别为表样式figure），不要中断，让后续分支继续
                     }
 
-                    if (tag === 'table' || (tag === 'figure' && node.querySelector('table'))) {
-                        const t = await this.adapter.extractTable(node);
-                        this.emitter.emitTable(t);
-                        continue;
-                    }
-
+                    // —— 列表 / 代码块 / 兜底 —— 
                     if (tag === 'ul' || tag === 'ol') {
                         for (const line of this._renderList(node, citeMap, 0)) this.emitter.emitParagraph(line);
                         continue;
                     }
-
                     if (tag === 'pre') {
                         const code = (node.textContent || '').replace(/\s+$/, '');
                         this.emitter.emitParagraph('```\n' + code + '\n```');
                         continue;
                     }
-
                     const fallback = (node.textContent || '').trim();
                     if (fallback) this.emitter.emitParagraph(fallback);
                 }
             }
 
-            // ① 脚注区（全部参考），形如 [^R1]: ...
+            // 脚注区（全部参考）
             const footR = this._makeReferenceFootnotes(bib);
             const footMap = new Map();
             for (const f of [...(footF || []), ...(footR || [])]) {
@@ -1472,7 +1639,7 @@
             }
             this.emitter.emitFootnotes([...footMap].map(([key, content]) => ({ key, content })));
 
-            // ② References（全部参考），形如 [1] ...
+            // References（全部参考）
             this.emitter.emitReferences(bib);
 
             return this.emitter.compose();
@@ -1486,23 +1653,66 @@
             alert('已生成 Links 版 Markdown。');
         }
         async exportBase64() {
-            const md = await this.runPipeline('base64');
+            const md = await this.runPipeline('base64');                // ← 必须是 'base64'
             const out = await this.exporter.asMarkdownBase64(md, this.assets.list());
             this._downloadText(out, this._suggestFileName('base64', 'md'));
             alert('已生成 Base64 版 Markdown。');
         }
+
         async exportTextBundle() {
-            const md = await this.runPipeline('textbundle');
+            const md = await this.runPipeline('textbundle'); // 确保是 textbundle 模式
             const tb = await this.exporter.asTextBundle(md, this.assets.list());
             this._downloadBlob(tb.blob, this._suggestFileName('textbundle', 'textbundle'));
-            alert('已生成 TextBundle。');
+            if (tb && typeof tb.external_count === 'number') {
+                if (tb.external_count > 0) {
+                    alert(`TextBundle 已生成，但仍有 ${tb.external_count} 个外链未打包（详见包内 diagnostics.txt）。`);
+                } else {
+                    alert('已生成 TextBundle（所有资源均已打包）。');
+                }
+            } else {
+                alert('已生成 TextBundle。');
+            }
         }
+
+        _prepareRun(mode) {
+            // 1) 清空文本缓冲
+            if (typeof this.emitter?.reset === 'function') {
+                this.emitter.reset();
+            } else {
+                this.emitter = new MarkdownEmitter(); // 兼容：万一你没加 reset()
+            }
+
+            // 2) 清空资源（即使 links 模式也清空，避免历史资产影响后续替换）
+            if (this.assets && typeof this.assets.clear === 'function') {
+                this.assets.clear();
+            }
+
+            // 3) 清空本次运行的状态寄存
+            this._cited = new Set();
+            this._lastMeta = null;
+
+            // 4)（可选）确保导出器仍绑定当前资产管理器
+            if (this.exporter && typeof this.exporter.bindAssets === 'function') {
+                this.exporter.bindAssets(this.assets);
+            }
+
+            // 5) 标记本次运行模式（如需在调试中使用）
+            this._runMode = mode || 'links';
+        }
+
 
         // —— 文中引文处理（[ ^R{n} ]） —— //
         _renderParagraphWithCites(pNode, citeMap) {
             const node = pNode.cloneNode(true);
 
-            // 把 MathJax 的 <script type="math/tex"> 提成 $...$ 或 $$...$$
+            // 去掉所有 UI 图标（不会影响公式）
+            node.querySelectorAll('svg.u-icon, .u-icon svg, .c-article__pill-button svg').forEach(el => el.remove());
+            // 删除仅含图标的空链接
+            for (const a of Array.from(node.querySelectorAll('a'))) {
+                if (!a.textContent || !a.textContent.trim()) a.remove();
+            }
+
+            // MathJax 内联 TeX
             for (const mj of Array.from(node.querySelectorAll('span.mathjax-tex'))) {
                 const sc = mj.querySelector('script[type^="math/tex"]');
                 if (sc) {
@@ -1512,7 +1722,7 @@
                 }
             }
 
-            // #ref-CR* / #rc-ref-CR* → [^Rn]
+            // 文内引文 #ref-CR* / #rc-ref-CR* → [^Rn]
             const sel = 'a[href^="#ref-CR"], a[href^="#rc-ref-CR"], a[href*="#ref-CR"], a[href*="#rc-ref-CR"]';
             for (const a of Array.from(node.querySelectorAll(sel))) {
                 const href = a.getAttribute('href') || '';
@@ -1523,10 +1733,12 @@
                 if (Number.isInteger(n) && n > 0) {
                     this._cited?.add?.(n);
                     a.replaceWith(document.createTextNode(`[^R${n}]`));
+                } else {
+                    a.replaceWith(document.createTextNode(a.textContent || ''));
                 }
             }
 
-            // 其它链接保留为 Markdown 链接
+            // 其余链接 → Markdown 链接
             for (const a of Array.from(node.querySelectorAll('a'))) {
                 const href = a.getAttribute('href') || '';
                 const txt = a.textContent || href;
@@ -1534,10 +1746,14 @@
                 else a.replaceWith(document.createTextNode(txt));
             }
 
-            // 行内强调/代码/上下标等 → Markdown（其余内联保持）
+            // 行内强调/代码/上下标
             const s = this._nodeToMarkdownInline(node);
+
+            // 修复 [[^R9], [^R11]] → [^R9], [^R11]
             return this._cleanNoiseText(
-                s.replace(/\[\s*\[\^R(\d+)\]\s*\]/g, '[^R$1]').replace(/\(\s*\[\^R(\d+)\]\s*\)/g, '[^R$1]')
+                s
+                    .replace(/\[\s*(\[\^R\d+\](?:\s*,\s*\[\^R\d+\])*)\s*\]/g, '$1')
+                    .replace(/\(\s*\[\^R(\d+)\]\s*\)/g, '[^R$1]')
             );
         }
 
@@ -1811,6 +2027,7 @@
         },
 
         async _genMarkdownForPreview(controller, mode) {
+            controller._prepareRun(mode);
             const md = await controller.runPipeline(mode);
             if (mode === 'base64') return await controller.exporter.asMarkdownBase64(md, controller.assets.list());
             return md;
