@@ -44,6 +44,7 @@
       maxDim: 4096,                 // 统一最长边限制（占位）
       concurrency: 4,               // 下载并发（占位）
     },
+    FIGURES: { captionStyle: 'plain' }, // 或 'italic'
     // —— 数学编号策略（已按你的决策设定）——
     MATH: {
       displayTag: 'inline',         // 将编号内嵌到 $$ ... \tag{n} $$ 中
@@ -234,23 +235,29 @@
      */
     walkSections() {
       const docTitle = this._mergeSoftWraps(this._text(this._$('h1.ltx_title.ltx_title_document')));
-      // 只取真正正文分节：S1/S2/…，可避免把标题/作者/摘要当分节再导一次
-      const sections = this._all('section.ltx_section[id^="S"]');
+
+      // 支持：section / subsection / subsubsection
+      const SEC_SEL = 'section.ltx_section[id^="S"], section.ltx_subsection[id^="S"], section.ltx_subsubsection[id^="S"]';
+      const sections = this._all(SEC_SEL);
       const seen = new Set();
       const out = [];
 
       for (const sec of sections) {
-        const h = this._$('h2.ltx_title_section, h3.ltx_title_para, h4.ltx_title_subsection, h5.ltx_title_subsubsection, h6.ltx_title', sec);
+        // 标题：通配任何 h2..h6 + .ltx_title（避免漏 h3/h4）
+        const h = this._$(':is(h2,h3,h4,h5,h6).ltx_title', sec);
         const title = this._mergeSoftWraps(this._text(h) || 'Section');
-        // 跳过与文档标题相同的分节（避免头部重复）
+
+        // 跳过与文档主标题同文的分节
         if (title && docTitle && this._eqLoose(title, docTitle)) continue;
 
-        // 分节去重 key：id + 低大小写标题
-        const key = `${sec.getAttribute('id') || ''}|${title.toLowerCase()}`;
+        // 分节去重 key
+        const id = sec.getAttribute('id') || '';
+        const key = `${id}|${title.toLowerCase()}`;
         if (seen.has(key)) continue;
         seen.add(key);
 
-        const selector = [
+        // 仅采集“直属当前 sec”的节点；排除落在任何子 section 里的节点
+        const NODE_SEL = [
           'div.ltx_para > p.ltx_p',
           'table.ltx_equation',
           'math[display="block"]',
@@ -261,11 +268,21 @@
           'div.ltx_note.ltx_role_footnote'
         ].join(',');
 
-        const allNodes = this._all(selector, sec);
-        const nodes = allNodes.filter(n => n.closest('section.ltx_section') === sec);
-        const level = 2 + this._sectionDepth(sec);
-        const anchor = sec.getAttribute('id') || this._slug(title);
+        const nodes = this._all(NODE_SEL, sec).filter(n => {
+          const nearest = n.closest(SEC_SEL);
+          if (nearest !== sec) return false;                        // 只要直属本节
+          if (n.matches?.('math[display="block"]') && n.closest('table.ltx_equation')) return false; // 交给 table 处理
+          if (n.matches?.('div.ltx_para > p.ltx_p') && n.closest('li')) return false;                 // 列表内段落交给列表
+          return true;
+        });
 
+        // 用实际 hN 作为 Markdown 层级；无标题则以深度兜底
+        let level = 2 + this._sectionDepth(sec);
+        if (h && /^h[2-6]$/i.test(h.tagName)) {
+          level = Math.max(2, Math.min(6, parseInt(h.tagName.slice(1), 10)));
+        }
+
+        const anchor = id || this._slug(title);
         out.push({ level, title, anchor, nodes });
       }
       return out;
@@ -330,21 +347,30 @@
       if (!fig) return null;
       const id = fig.getAttribute('id') || null;
 
-      // caption 清洗：去掉 "Figure N ." 前缀
-      let caption = this._text(this._$('figcaption.ltx_caption', fig));
-      caption = caption ? caption.replace(/^\s*Figure\s+\d+\s*\.\s*/i, '').trim() : '';
+      // 处理 figcaption：把 MathML → $TeX$；清理 "Figure n: "
+      let caption = '';
+      const capEl = this._$('figcaption.ltx_caption', fig);
+      if (capEl) {
+        const clone = capEl.cloneNode(true);
+        for (const m of Array.from(clone.querySelectorAll('math'))) {
+          const tex = this._extractTeX(m);
+          m.replaceWith(document.createTextNode(tex ? `$${tex}$` : ''));
+        }
+        caption = this._mergeSoftWraps(clone.textContent || '')
+          .replace(/^\s*Figure\s+\d+\s*[:.]\s*/i, '')
+          .trim();
+      }
 
       const img = this._$('img', fig);
       if (img) {
         const raw = img.getAttribute('src') || img.getAttribute('data-src') || null;
         if (raw) {
-          const src = this._abs(raw);   // ★ 绝对化
+          const src = this._abs(raw);   // 绝对化
           return { kind: 'img', src, caption, id };
         }
       }
       const svg = this._$('svg', fig);
       if (svg) {
-        // 直接保留内联 SVG 字符串；是否另存文件由上层策略决定
         const inlineSvg = svg.outerHTML;
         return { kind: 'svg', inlineSvg, caption, id };
       }
@@ -622,10 +648,10 @@
     _sectionDepth(sec) {
       let d = 1, p = sec.parentElement;
       while (p) {
-        if (p.matches && p.matches('section.ltx_section')) d++;
+        if (p.matches && (p.matches('section.ltx_section') || p.matches('section.ltx_subsection') || p.matches('section.ltx_subsubsection'))) d++;
         p = p.parentElement;
       }
-      return d; // 顶层=1
+      return d;
     }
 
     _cellsToText(cells) {
@@ -755,31 +781,42 @@
     emitFigure(fig) {
       if (!fig) return;
 
-      if (fig.kind === 'img' && fig.path) {
-        const alt = this._mergeSoftWraps(fig.caption || '');
-        this.buffers.body.push(`![${alt}](${fig.path})`);
-        if (fig.caption) this.buffers.body.push(this._mergeSoftWraps(fig.caption));
+      // 在插入图片前，若上一个 body 行不是空行，补一个空行，避免粘段
+      this._ensureBlockGap();
+
+      const caption = this._mergeSoftWraps(fig.caption || '');
+      const captionLine = caption
+        ? (this.cfg?.FIGURES?.captionStyle === 'italic' ? `*${caption}*` : caption)
+        : '';
+
+      if (fig.kind === 'img' && (fig.path || fig.src)) {
+        const path = fig.path || fig.src;
+        // 1) 图片行
+        this.buffers.body.push(`![${caption}](${path})`);
+        // 2) 紧跟一行图题（可见文本，包含 $..$ 的公式）
+        if (captionLine) this.buffers.body.push(captionLine);
+        // 3) 收尾空行
         this.buffers.body.push('');
         return;
       }
 
       if (fig.kind === 'svg') {
         if (this.cfg?.IMAGES?.inlineSvgInMarkdown && fig.inlineSvg) {
-          // 直接内联 SVG（Links/Base64 形态）；TextBundle 由上层落地文件
+          // 1) 内联 SVG（占一整块）
           this.buffers.body.push(fig.inlineSvg);
-          if (fig.caption) this.buffers.body.push(this._mergeSoftWraps(fig.caption));
+          // 2) 紧跟一行图题
+          if (captionLine) this.buffers.body.push(captionLine);
+          // 3) 收尾空行
           this.buffers.body.push('');
-          return;
-        }
-        if (fig.path) {
-          const alt = this._mergeSoftWraps(fig.caption || '');
-          this.buffers.body.push(`![${alt}](${fig.path})`);
-          if (fig.caption) this.buffers.body.push(this._mergeSoftWraps(fig.caption));
+        } else if (fig.path) {
+          this.buffers.body.push(`![${caption}](${fig.path})`);
+          if (captionLine) this.buffers.body.push(captionLine);
           this.buffers.body.push('');
-          return;
+        } else {
+          this.buffers.body.push('<!-- TODO: SVG figure placeholder -->');
+          if (captionLine) this.buffers.body.push(captionLine);
+          this.buffers.body.push('');
         }
-        this.buffers.body.push('<!-- TODO: SVG figure placeholder -->');
-        this.buffers.body.push('');
       }
     }
 
@@ -880,6 +917,22 @@
         .replace(/\r?\n/g, '<br>')
         .replace(/\t/g, ' ')
         .trim();
+    }
+
+    /** 若 body 末尾不是空行，则补一个空行，保证块级元素前有分隔 */
+    _ensureBlockGap() {
+      const body = this.buffers?.body;
+      if (!body || !body.length) return;
+      // 找到最后一个非空元素
+      for (let i = body.length - 1; i >= 0; i--) {
+        const line = body[i];
+        if (line === '') return;          // 已是空行，无需再加
+        if (typeof line === 'string') {
+          // 末行是非空字符串 -> 补一个空行
+          body.push('');
+          return;
+        }
+      }
     }
   }
 
@@ -1701,7 +1754,11 @@
     // —— 节点类型判断 —— //
     _isParagraph(n) { return n.matches && (n.matches('div.ltx_para > p.ltx_p') || n.matches('p.ltx_p')); }
     _isDisplayMath(n) {
-      return n.matches && (n.matches('table.ltx_equation') || n.matches('math[display="block"]'));
+      if (!n?.matches) return false;
+      if (n.matches('table.ltx_equation')) return true;
+      // 只有“不在 table.ltx_equation 里的 block math”才算一条
+      if (n.matches('math[display="block"]') && !n.closest('table.ltx_equation')) return true;
+      return false;
     }
 
     // 追加：清理噪声文本
