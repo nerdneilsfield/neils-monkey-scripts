@@ -144,57 +144,36 @@
 
         // 1) 直接替换：主动点击“References”标签再抓侧栏引用
         async collectBibliography() {
-            // 1) 正文区 #Bib1（少数模板）
-            const BibSec = U.$('section#Bib1');
-            if (BibSec) {
-                const nodes = BibSec.querySelectorAll('ol.c-article-references > li, li.c-article-references__item, li[id^="ref-CR"]');
-                if (nodes && nodes.length) return this._parseBibList(nodes);
-            }
+            // 允许两种写法：#Bib1 或 <section aria-labelledby="Bib1">
+            const sec = document.querySelector('section#Bib1, section[aria-labelledby="Bib1"]');
+            if (!sec) return [];
 
-            // 2) 侧栏：激活 tab → 等 panel → 等列表
-            await this._activateReferencesTab();
-            let panel = U.$('#tabpanel-references');
-            if (!panel) {
-                await this._waitFor(() => !!U.$('#tabpanel-references'), 1500, 100);
-                panel = U.$('#tabpanel-references');
-            }
-            const hasList = () => !!panel?.querySelector('ol.c-reading-companion__references-list li[id^="rc-ref-CR"]');
-            if (!hasList()) {
-                try {
-                    panel?.scrollTo?.({ top: 0 });
-                    panel?.scrollTo?.({ top: panel.scrollHeight || 0 });
-                    panel?.scrollTo?.({ top: 0 });
-                } catch { }
-                await this._waitFor(hasList, 3500, 120);
-            }
+            // 主体列表
+            const list = sec.querySelectorAll('ol.c-article-references > li.c-article-references__item, ol.c-article-references > li, li.c-article-references__item');
+            if (!list || !list.length) return [];
 
-            const items = panel?.querySelectorAll('ol.c-reading-companion__references-list li[id^="rc-ref-CR"]');
-            if (items && items.length) return this._parseBibList(items);
-
-            // 3) 兜底：全页扫描
-            const any = this.doc.querySelectorAll('li[id^="ref-CR"], li[id^="rc-ref-CR"]');
-            if (any && any.length) return this._parseBibList(any);
-
-            return [];
+            return this._parseBibListMain(list);
         }
-
 
         buildCitationMap(bibItems) {
             const map = new Map();
+            const base = (this.links?.html) || location.href;
 
-            for (const it of bibItems || []) {
+            for (const it of (bibItems || [])) {
                 if (!it?.id || typeof it.num !== 'number') continue;
-                const id = it.id;            // 'ref-CR7' / 'rc-ref-CR7'
-                const hash = `#${id}`;
+                const id = it.id;                  // e.g., 'ref-CR7'
+                const hash = id.startsWith('#') ? id : `#${id}`;
                 map.set(id, it.num);
                 map.set(hash, it.num);
-                if (this.links.html) map.set(`${this.links.html}${hash}`, it.num);
+                map.set(`${base.replace(/#.*$/, '')}${hash}`, it.num);
             }
 
-            for (const a of this.doc.querySelectorAll('a[href^="#ref-CR"], a[href^="#rc-ref-CR"]')) {
+            // 正文里的 a[href] 变体兜底
+            const sel = 'a[href^="#ref-CR"], a[href*="#ref-CR"]';
+            for (const a of document.querySelectorAll(sel)) {
                 const href = a.getAttribute('href') || '';
                 const n = this._parseRefNumber(href);
-                if (!map.has(href) && n != null) map.set(href, n);
+                if (Number.isInteger(n) && !map.has(href)) map.set(href, n);
             }
             return map;
         }
@@ -291,71 +270,43 @@
             if (!fig) return null;
             const id = fig.getAttribute('id') || null;
 
-            // 1) Label: <figcaption><b data-test="figure-caption-text">Fig. N.</b>
-            let label = '';
-            const b = fig.querySelector('figcaption b.c-article-section__figure-caption,[data-test="figure-caption-text"]');
-            if (b) label = (b.textContent || '').trim().replace(/\s+/g, ' '); // "Fig. 1."
-
-            // 2) Desc（你指出的真正图题文本）：.c-article-section__figure-description
-            let desc = '';
+            // —— 1) 主文标题：<figcaption><b>Fig. N.</b> + .c-article-section__figure-description —— //
+            const labelEl = fig.querySelector('figcaption b.c-article-section__figure-caption,[data-test="figure-caption-text"]');
+            const label = labelEl ? (labelEl.textContent || '').trim().replace(/\s+/g, ' ') : ''; // "Fig. 1."
             const descEl = fig.querySelector('.c-article-section__figure-description,[data-test="bottom-caption"]');
-            if (descEl) desc = U.mergeSoftWraps(descEl.textContent || '');
+            const desc = descEl ? U.mergeSoftWraps(descEl.textContent || '') : '';
+            let caption = this._cleanCaption(label, desc);
 
-            // 初始 caption 组合
-            let caption = (label || '') + (desc ? (label ? ' ' : '') + desc : '');
+            // —— 2) 主文图片：<img> / <source srcset> —— //
+            const inlineImg = fig.querySelector('img, picture source[srcset]');
+            const inlinePick = inlineImg
+                ? (inlineImg.tagName.toLowerCase() === 'img'
+                    ? this._pickImgSource(inlineImg)
+                    : (this._bestFromSrcset(inlineImg.getAttribute('srcset') || '') || null))
+                : null;
+            const inlineUrl = inlinePick ? U.absolutize(inlinePick, this.baseHref) : null;
 
-            // 3) inline <img>（若没 full link，也至少可用）
-            const inlineImg = fig.querySelector('img');
-            const inlinePick = inlineImg ? this._pickImgSource(inlineImg) : null;
-
-            // 4) 二跳：a[data-test="img-link"] 或 “Full size image” 链接 → /figures/{n}
-            const jump = fig.querySelector('a[data-test="img-link"], a[aria-label^="Full size image"], a[href*="/figures/"]');
-            if (jump) {
-                const url = U.absolutize(jump.getAttribute('href') || '', this.baseHref);
-                const page = await this._fetchDoc(url).catch(() => null);
-                if (page) {
-                    // full 图：<picture><source srcset=".../full/...">
-                    const source = page.querySelector('picture source[srcset]') || null;
-                    if (source) {
-                        const best = this._bestFromSrcset(source.getAttribute('srcset') || '');
-                        if (best) {
-                            // 取 /full/ 版本
-                            const fullUrl = U.absolutize(best, url);
-                            // 取标题：<h1 id="FigN">Fig. N.</h1> + <div data-test="bottom-caption">desc</div>
-                            const topCap = page.querySelector('h1.c-article-satellite-title,[data-test="top-caption"]');
-                            const pageLabel = topCap ? (topCap.textContent || '').trim() : '';
-                            const bottomDesc = page.querySelector('.c-article-figure-description,[data-test="bottom-caption"]');
-                            const pageDesc = bottomDesc ? U.mergeSoftWraps(bottomDesc.textContent || '') : '';
-                            const pageCaption = (pageLabel || '') + (pageDesc ? (pageLabel ? ' ' : '') + pageDesc : '');
-                            caption = pageCaption || caption;
-                            return { kind: 'img', src: fullUrl, caption, id };
-                        }
-                    }
-                    // 若没找到 source，再兜底 <img src=.../full/...>
-                    const bigImg = page.querySelector('img[src*="/full/"]') || page.querySelector('img[src]');
-                    if (bigImg) {
-                        const src = U.absolutize(bigImg.getAttribute('src') || '', url);
-                        const topCap = page.querySelector('h1.c-article-satellite-title,[data-test="top-caption"]');
-                        const pageLabel = topCap ? (topCap.textContent || '').trim() : '';
-                        const bottomDesc = page.querySelector('.c-article-figure-description,[data-test="bottom-caption"]');
-                        const pageDesc = bottomDesc ? U.mergeSoftWraps(bottomDesc.textContent || '') : '';
-                        const pageCaption = (pageLabel || '') + (pageDesc ? (pageLabel ? ' ' : '') + pageDesc : '');
-                        caption = pageCaption || caption;
-                        return { kind: 'img', src, caption, id };
-                    }
+            // —— 3) 二跳链接：a[data-test="img-link"] / a[href*="/figures/"]（优先 /full/）—— //
+            const jumpA = fig.querySelector('a[data-test="img-link"], a[aria-label^="Full size image"], a[href*="/figures/"]');
+            if (jumpA) {
+                const satURL = U.absolutize(jumpA.getAttribute('href') || '', this.baseHref);
+                const sat = await this._getSatelliteFigureDataWithRetry(satURL, 3);
+                if (sat?.src) {
+                    // 标题优先用卫星页组合（h1 + bottom-caption）
+                    caption = sat.caption || caption;
+                    return { kind: 'img', src: sat.src, caption, id };
                 }
             }
 
-            // 5) 无二跳或失败 → 用 inline
-            if (inlinePick) return { kind: 'img', src: inlinePick, caption, id };
+            // —— 4) 无二跳或失败 → 用主文图 —— //
+            if (inlineUrl) return { kind: 'img', src: inlineUrl, caption, id };
 
-            // 6) inline <svg> 兜底
+            // —— 5) inline SVG 兜底 —— //
             const svg = fig.querySelector('svg');
             if (svg) return { kind: 'svg', inlineSvg: svg.outerHTML, caption, id };
 
             return null;
         }
-
         /**
          * 表：若本页无 <table>，则尝试 “Full size table” 二跳抓取；最终转为 headers/rows 或 html 降级
          * @returns {{headers?:string[][], rows?:string[][], html?:string}}
@@ -363,34 +314,29 @@
         async extractTable(root) {
             if (!root) return { html: '' };
 
-            // a[data-test="table-link"] → /tables/{n}
+            // —— 1) 找“Full size table”跳转 —— //
             const link = root.querySelector('a[data-test="table-link"], a[aria-label^="Full size table"], a[href*="/tables/"]');
             if (link) {
                 const url = U.absolutize(link.getAttribute('href') || '', this.baseHref);
-                const page = await this._fetchDoc(url).catch(() => null);
-                if (page) {
-                    const title = (page.querySelector('h1.c-article-satellite-title#table-1-title,[id^="table-"][id$="-title"]')?.textContent || '').trim();
-                    const table = page.querySelector('main .c-article-table-container table, main table');
-                    if (table) {
-                        // 复杂表：直接内嵌原始 HTML，保留标题
-                        const html = `<div class="table-caption">${U.mergeSoftWraps(title)}</div>\n${table.outerHTML}`;
-                        return { html };
-                    }
-                    // 兜底：无 <table> 也保留标题和跳转链接
-                    return { html: `<div class="table-caption">${U.mergeSoftWraps(title)}</div>\n<p><a href="${url}" target="_blank" rel="noopener">Open full size table</a></p>` };
+                const sat = await this._getSatelliteTableDataWithRetry(url, 3);
+                if (sat?.tableHtml) {
+                    const titleHtml = sat.title ? `<div class="table-caption">${U.mergeSoftWraps(sat.title)}</div>\n` : '';
+                    return { html: `${titleHtml}${sat.tableHtml}` }; // 复杂表直接内嵌
                 }
+                // 卫星页没取到表：返回明确占位，避免误混正文段落
+                return { html: `<div class="table-caption">${U.mergeSoftWraps(sat?.title || 'Table')}</div>\n<p><a href="${url}" target="_blank" rel="noopener">Open full size table</a></p>` };
             }
 
-            // 有时 inline figure 里就有 table
+            // —— 2) 主文若真的内嵌了 <table>（少见）—— //
             const table = root.tagName.toLowerCase() === 'table' ? root : root.querySelector('table');
             if (table) {
-                // 复杂判断：有 rowspan/colspan → 内嵌 HTML，否则交给 MarkdownEmitter 转网格
                 const hasSpan = !!table.querySelector('[rowspan],[colspan]');
-                if (hasSpan) return { html: table.outerHTML };
-                return this._tableToMatrix(table);
+                if (hasSpan) return { html: table.outerHTML };           // 复杂表：内嵌 HTML
+                return this._tableToMatrix(table);                       // 简单表：转 Markdown 网格
             }
 
-            return { html: root.outerHTML };
+            // —— 3) 全无：保留占位，指向原处 —— //
+            return { html: `<p><a href="${location.href}#${root.id || ''}">Table not found (try opening Full size table)</a></p>` };
         }
 
         extractFootnote(node) {
@@ -405,6 +351,132 @@
         }
 
         // ===== Internals =====
+
+
+        // —— 通用重试 —— //
+        async _getSatelliteFigureDataWithRetry(url, tries = 3) {
+            let delay = 220;
+            for (let i = 0; i < tries; i++) {
+                const out = await this._getSatelliteFigureData(url).catch(() => null);
+                if (out?.src) return out;
+                await this._sleep(delay); delay = Math.min(1200, Math.floor(delay * 1.8));
+            }
+            return null;
+        }
+
+        async _getSatelliteTableDataWithRetry(url, tries = 3) {
+            let delay = 220;
+            for (let i = 0; i < tries; i++) {
+                const out = await this._getSatelliteTableData(url).catch(() => null);
+                if (out?.tableHtml) return out;
+                await this._sleep(delay); delay = Math.min(1200, Math.floor(delay * 1.8));
+            }
+            return null;
+        }
+
+        // —— Figure 卫星页解析：<h1> + bottom caption + full 图 —— //
+        async _getSatelliteFigureData(url) {
+            const doc = await this._fetchDoc(url);
+            if (!doc) return null;
+
+            // 标题：<h1 class="c-article-satellite-title u-h1" data-test="top-caption" id="Fig3">Fig. 3.</h1>
+            const h1 = doc.querySelector('main h1.c-article-satellite-title,[data-test="top-caption"]');
+            const pageLabel = h1 ? (h1.textContent || '').trim().replace(/\s+/g, ' ') : '';
+
+            // 描述：<div class="c-article-figure-description" data-test="bottom-caption" id="figure-3-desc"><p>…</p></div>
+            const bottomDesc = doc.querySelector('main .c-article-figure-description,[data-test="bottom-caption"]');
+            const pageDesc = bottomDesc ? U.mergeSoftWraps(bottomDesc.textContent || '') : '';
+
+            // 组合 caption
+            const caption = this._cleanCaption(pageLabel, pageDesc);
+
+            // 图片：优先 <picture><source srcset="…/full/…">；再 fallback 到 <img src>
+            const source = doc.querySelector('main picture source[srcset]');
+            if (source) {
+                const best = this._bestFromSrcset(source.getAttribute('srcset') || '');
+                if (best) return { src: U.absolutize(best, url), caption };
+            }
+            const img = doc.querySelector('main img[src]');
+            if (img) return { src: U.absolutize(img.getAttribute('src'), url), caption };
+
+            return { src: null, caption };
+        }
+
+        // —— Table 卫星页解析：<h1 id="table-1-title">…</h1> + .c-article-table-container table —— //
+        async _getSatelliteTableData(url) {
+            const doc = await this._fetchDoc(url);
+            if (!doc) return null;
+
+            // 标题
+            const h1 = doc.querySelector('main h1.c-article-satellite-title[id^="table-"][id$="-title"], main h1.c-article-satellite-title');
+            const title = h1 ? (h1.textContent || '').trim().replace(/\s+/g, ' ') : '';
+
+            // 表：严格从容器取，避免抓到正文段落
+            const t = doc.querySelector('main .c-article-table-container table, main .c-table-scroll-wrapper__content table, main table.data, main table');
+            if (t) {
+                // 仅取 table.outerHTML，避免混入外围正文文本
+                return { title, tableHtml: t.outerHTML };
+            }
+            return { title, tableHtml: null };
+        }
+
+        // —— 细节工具 —— //
+        _cleanCaption(label, desc) {
+            const L = (label || '').replace(/\s+/g, ' ').trim();
+            const D = U.mergeSoftWraps(desc || '');
+            if (L && D) return `${L} ${D.replace(/^\s*Fig\.\s*\d+\.?\s*/i, '')}`;
+            return L || D || '';
+        }
+
+        _sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+        _parseBibListMain(nodeList) {
+            const out = [];
+            let auto = 1;
+
+            for (const li of Array.from(nodeList)) {
+                // 文本段（通常在 <p class="c-article-references__text" id="ref-CRn">）
+                const textP = li.querySelector('.c-article-references__text') || li;
+                const idRaw = textP.getAttribute('id') || li.getAttribute('id') || '';
+                const numById = this._parseRefNumber(idRaw);
+
+                // data-counter="1." 也可兜底取号
+                const dc = (li.getAttribute('data-counter') || '').trim();
+                const numByDC = dc ? parseInt(dc, 10) : null;
+
+                const num = Number.isInteger(numById) && numById > 0
+                    ? numById
+                    : (Number.isInteger(numByDC) && numByDC > 0 ? numByDC : (auto++));
+
+                // 纯文本
+                let text = U.mergeSoftWraps(textP.textContent || '');
+
+                // DOI/URL
+                let doi = null, url = null, gscholar = null;
+
+                // Google Scholar 通常在单独一行：<p class="c-article-references__links">…</p>
+                const scholarA = li.querySelector('.c-article-references__links a[href*="scholar.google"]');
+                if (scholarA) gscholar = scholarA.getAttribute('href');
+
+                // 文本段里面的链接：先 DOI，再首个非 Scholar 的 http(s)
+                for (const a of Array.from(textP.querySelectorAll('a[href]'))) {
+                    const href = a.getAttribute('href') || '';
+                    if (/^mailto:/i.test(href)) continue;
+                    if (!doi && /doi\.org\//i.test(href)) doi = href;
+                    if (!url && /^https?:\/\//i.test(href) && !/scholar\.google\./i.test(href)) url = href;
+                }
+
+                // 去掉“Google Scholar”尾巴（它本来在 links 段，不应混在 text 里）
+                text = text.replace(/\bGoogle Scholar\b\s*$/i, '').trim();
+
+                out.push({ num, id: idRaw || `ref-CR${num}`, text, doi, url, gscholar });
+            }
+
+            // 保序 & 去重（按 num）
+            const uniq = new Map();
+            for (const it of out) if (!uniq.has(it.num)) uniq.set(it.num, it);
+            return Array.from(uniq.values()).sort((a, b) => a.num - b.num);
+        }
 
 
 
