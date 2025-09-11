@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name         Springer Chapter to Markdown Exporter (Framework)
 // @namespace    http://tampermonkey.net/
-// @version      1.0.0
+// @version      1.0.1
 // @description  Export SpringerLink chapter pages to Markdown (Links/Base64/TextBundle) — Framework Only
 // @author       qiqi
 // @match        https://link.springer.com/chapter/*
+// @match        https://link.springer.com/article/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_addStyle
 // @grant        GM_setClipboard
@@ -2048,8 +2049,8 @@
     // -----------------------------
     function boot() {
         try {
-            const ok = /^\/chapter\//.test(location.pathname);
-            if (!ok) { Log.warn('当前不在 Springer 章节页，UI 不加载。'); return; }
+            const ok = /^\/chapter\//.test(location.pathname) || /^\/article\//.test(location.pathname);
+            if (!ok) { Log.warn('当前不在 Springer 章节页或文章页，UI 不加载。'); return; }
             const controller = new Controller();
             window.__SP_CTRL__ = controller; // for preview
             UI.mount(controller);
