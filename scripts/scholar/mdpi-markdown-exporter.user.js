@@ -60,9 +60,37 @@
     // 1) Logger
     // -----------------------------
     const Log = {
-        info: (...a) => console.log(`[${Config.APP_NAME}]`, ...a),
-        warn: (...a) => console.warn(`[${Config.APP_NAME}]`, ...a),
-        error: (...a) => console.error(`[${Config.APP_NAME}]`, ...a),
+        _entries: [],
+        
+        info: (...a) => {
+            const msg = a.join(' ');
+            console.log(`[${Config.APP_NAME}]`, ...a);
+            Log._entries.push(`[INFO] ${msg}`);
+            Log._updateUI();
+        },
+        warn: (...a) => {
+            const msg = a.join(' ');
+            console.warn(`[${Config.APP_NAME}]`, ...a);
+            Log._entries.push(`[WARN] ${msg}`);
+            Log._updateUI();
+        },
+        error: (...a) => {
+            const msg = a.join(' ');
+            console.error(`[${Config.APP_NAME}]`, ...a);
+            Log._entries.push(`[ERROR] ${msg}`);
+            Log._updateUI();
+        },
+        
+        _updateUI: () => {
+            const logPanel = document.querySelector('[data-role="debug-log"]');
+            if (logPanel && !logPanel.classList.contains('mdpi-md-hide')) {
+                const content = logPanel.querySelector('.mdpi-md-log__content');
+                if (content) {
+                    content.textContent = Log._entries.join('\n');
+                    content.scrollTop = content.scrollHeight;
+                }
+            }
+        }
     };
 
     // -----------------------------
@@ -1551,11 +1579,50 @@
             this.emitter = new MarkdownEmitter();
             this.exporter = new Exporter();
             this.exporter.bindAssets(this.assets);
+            
+            // 缓存系统
+            this._cache = {
+                meta: null,
+                bibliography: null,
+                citationMap: null,
+                sections: null,
+                baseMarkdown: null,
+                lastPageHash: null
+            };
         }
 
         async runPipeline(mode = 'links') {
-            this._prepareRun(mode);   // 每次运行先清空
+            this._prepareRun(mode, false); // false表示不清除缓存
             Log.info('Pipeline start:', mode);
+            
+            // 检查缓存有效性
+            const currentPageHash = this._getPageHash();
+            const cacheValid = this._cache.lastPageHash === currentPageHash && this._cache.baseMarkdown;
+            
+            if (!cacheValid) {
+                Log.info('Cache invalid or missing, rebuilding base cache...');
+                await this._buildBaseCacheWithOriginalLogic();
+                this._cache.lastPageHash = currentPageHash;
+            } else {
+                Log.info('Using cached data for faster processing...');
+                // 恢复缓存的状态
+                this._lastMeta = this._cache.meta;
+            }
+            
+            // 根据模式处理差异
+            if (mode === 'links') {
+                Log.info('Using cached links mode markdown...');
+                return this._cache.baseMarkdown;
+            } else {
+                Log.info('Processing mode-specific logic for:', mode);
+                return await this._regenerateWithModeSpecificLogic(mode);
+            }
+        }
+
+        // 原始 runPipeline 逻辑的备份（用于缓存构建）
+        async _originalRunPipeline(mode = 'links') {
+            this._prepareRun(mode);   // 每次运行先清空
+            Log.info('Original Pipeline start:', mode);
 
             // 1) Meta / Bib / CiteMap
             const meta = this.adapter.getMeta();
@@ -1749,7 +1816,7 @@
             }
         }
 
-        _prepareRun(mode) {
+        _prepareRun(mode, clearCache = true) {
             // 1) 清空文本缓冲
             if (typeof this.emitter?.reset === 'function') {
                 this.emitter.reset();
@@ -1773,6 +1840,120 @@
 
             // 5) 标记本次运行模式（如需在调试中使用）
             this._runMode = mode || 'links';
+        }
+
+        // —— 缓存相关方法 —— //
+        
+        /**
+         * 生成页面哈希用于缓存失效检测
+         */
+        _getPageHash() {
+            const title = document.title || '';
+            const bodyLength = document.body ? document.body.textContent.length : 0;
+            const articleContent = document.querySelector('article')?.textContent?.length || 0;
+            return `${title}-${bodyLength}-${articleContent}`;
+        }
+
+        /**
+         * 构建基础缓存数据（使用原始完整逻辑，固定为links模式）
+         */
+        async _buildBaseCacheWithOriginalLogic() {
+            Log.info('Building base cache data with original logic...');
+            
+            // 提取基础数据
+            const meta = this.adapter.getMeta();
+            Log.info('Cached metadata:', { title: meta.title, authors: meta.authors?.length || 0 });
+            
+            const bib = await this.adapter.collectBibliography();
+            const citeMap = this.adapter.buildCitationMap(bib);
+            const sections = this.adapter.walkSections();
+            
+            // 缓存基础数据
+            this._cache.meta = meta;
+            this._cache.bibliography = bib;
+            this._cache.citationMap = citeMap;
+            this._cache.sections = sections;
+            
+            // 生成基础Markdown（使用links模式的完整原始逻辑）
+            this._cache.baseMarkdown = await this._generateBaseCacheMarkdown(meta, bib, citeMap, sections);
+            
+            Log.info('Base cache built successfully');
+        }
+
+        /**
+         * 使用缓存数据生成基础Markdown
+         */
+        async _generateBaseCacheMarkdown(meta, bib, citeMap, sections) {
+            // 清空状态
+            this._cited = new Set();
+            const footF = [];
+            
+            // Front matter + TOC
+            const frontMatter = this.adapter.extractFrontMatter();
+            const toc = this.adapter.extractTableOfContents();
+            
+            // 生成内容
+            let md = this.emitter.meta(meta);
+            if (frontMatter) md += frontMatter + '\n\n';
+            if (toc) md += toc + '\n\n';
+            
+            // 处理各个章节
+            for (const sec of sections) {
+                const secMd = await this.emitter.section(sec);
+                md += secMd + '\n\n';
+            }
+            
+            // 添加参考文献
+            if (bib?.length) {
+                const refList = this.emitter.referencesList(bib, { ...citeMap });
+                md += refList;
+            }
+            
+            // 添加脚注
+            if (footF?.length) {
+                const footnoteList = this.emitter.footnotesList(footF);
+                md += footnoteList;
+            }
+            
+            return md;
+        }
+
+        /**
+         * 使用模式特定逻辑重新生成
+         */
+        async _regenerateWithModeSpecificLogic(mode) {
+            const { meta, bib, citeMap, sections } = this._cache;
+            
+            // 重置状态
+            this._cited = new Set();
+            this._lastMeta = meta;
+            
+            // 对于非links模式，需要重新运行图片处理逻辑
+            if (mode === 'base64' || mode === 'textbundle') {
+                // 重新处理资产以支持模式特定的图片处理
+                this.assets.clear();
+                
+                // 重新走一遍处理流程，但使用缓存的结构化数据
+                for (const sec of sections) {
+                    await this.emitter.section(sec, this);
+                }
+            }
+            
+            return this._cache.baseMarkdown;
+        }
+
+        /**
+         * 缓存失效
+         */
+        _invalidateCache() {
+            this._cache = {
+                meta: null,
+                bibliography: null,
+                citationMap: null,
+                sections: null,
+                baseMarkdown: null,
+                lastPageHash: null
+            };
         }
 
 
@@ -1962,6 +2143,22 @@
         .mdpi-md-btn--secondary:hover{background:rgba(0,0,0,.05)}
         .mdpi-md-btn--ghost{background:transparent;color:var(--ax-muted)} .mdpi-md-btn--ghost:hover{color:var(--ax-text)}
         .mdpi-md-hide{display:none!important}
+        
+        /* Debug Log Panel */
+        .mdpi-md-log{margin-top:8px;border:1px solid var(--ax-border);border-radius:8px;background:rgba(0,0,0,.02)}
+        .mdpi-md-log__header{display:flex;justify-content:space-between;align-items:center;padding:6px 8px;border-bottom:1px solid var(--ax-border);background:rgba(0,0,0,.03)}
+        .mdpi-md-log__title{font-size:11px;font-weight:700;color:var(--ax-muted)}
+        .mdpi-md-log__actions{display:flex;gap:4px}
+        .mdpi-md-log__btn{padding:2px 6px;font-size:10px;border:0;border-radius:4px;cursor:pointer;background:transparent;color:var(--ax-muted);font-weight:500}
+        .mdpi-md-log__btn:hover{color:var(--ax-text);background:rgba(0,0,0,.05)}
+        .mdpi-md-log__content{height:120px;overflow-y:auto;padding:6px 8px;font-family:ui-monospace,SFMono-Regular,Monaco,Consolas;font-size:10px;line-height:1.3;white-space:pre-wrap;word-break:break-word;color:var(--ax-text);background:#fff0}
+        @media (prefers-color-scheme: dark){.mdpi-md-log{background:rgba(255,255,255,.02)}.mdpi-md-log__header{background:rgba(255,255,255,.03)}.mdpi-md-log__content{background:rgba(0,0,0,.1)}}
+        
+        /* Footer */
+        .mdpi-md-footer{margin-top:8px;padding-top:6px;border-top:1px solid var(--ax-border);text-align:center;font-size:10px;color:var(--ax-muted)}
+        .mdpi-md-footer a{color:var(--ax-accent);text-decoration:none}
+        .mdpi-md-footer a:hover{text-decoration:underline}
+        
         .mdpi-md-overlay{position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:${Z + 1};display:none}
         .mdpi-md-modal{position:fixed;inset:5% 8%;background:var(--ax-bg);color:var(--ax-text);border:1px solid var(--ax-border);border-radius:12px;box-shadow:var(--ax-shadow);display:none;z-index:${Z + 2};overflow:hidden;display:flex;flex-direction:column}
         .mdpi-md-modal__bar{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid var(--ax-border)}
@@ -1978,7 +2175,7 @@
             panel.innerHTML = `
         <div class="mdpi-md-panel__head">
           <div class="mdpi-md-panel__title">
-            <span class="mdpi-md-badge">Springer</span>
+            <span class="mdpi-md-badge">MDPI</span>
             <span>Markdown 导出</span>
           </div>
           <button class="mdpi-md-btn mdpi-md-btn--ghost" data-action="toggle">折叠</button>
@@ -1990,6 +2187,20 @@
           <button class="mdpi-md-btn" data-action="links">导出 · 链接</button>
           <button class="mdpi-md-btn" data-action="base64">导出 · Base64</button>
           <button class="mdpi-md-btn mdpi-md-btn--secondary" data-action="textbundle">导出 · TextBundle</button>
+          <button class="mdpi-md-btn mdpi-md-btn--ghost" data-action="debug-log">调试日志</button>
+        </div>
+        <div class="mdpi-md-log mdpi-md-hide" data-role="debug-log">
+          <div class="mdpi-md-log__header">
+            <span class="mdpi-md-log__title">调试日志</span>
+            <div class="mdpi-md-log__actions">
+              <button class="mdpi-md-log__btn" data-action="clear-log">清空</button>
+              <button class="mdpi-md-log__btn" data-action="copy-log">复制</button>
+            </div>
+          </div>
+          <div class="mdpi-md-log__content"></div>
+        </div>
+        <div class="mdpi-md-footer">
+          © Qi Deng - <a href="https://github.com/nerdneilsfield/neils-monkey-scripts/" target="_blank">GitHub</a>
         </div>
         `;
             document.body.appendChild(panel);
@@ -2010,6 +2221,24 @@
                         const md = await UI._genMarkdownForPreview(controller, mode);
                         const { overlay, modal } = UI._ensurePreview();
                         UI._openPreview(modal, overlay, md, mode, controller);
+                    }
+                    if (act === 'debug-log') {
+                        const logPanel = panel.querySelector('[data-role="debug-log"]');
+                        logPanel.classList.toggle('mdpi-md-hide');
+                        if (!logPanel.classList.contains('mdpi-md-hide')) {
+                            Log._updateUI(); // Update content when showing
+                        }
+                    }
+                    if (act === 'clear-log') {
+                        const logContent = panel.querySelector('.mdpi-md-log__content');
+                        if (logContent) logContent.textContent = '';
+                        if (Log._entries) Log._entries = [];
+                    }
+                    if (act === 'copy-log') {
+                        const logContent = panel.querySelector('.mdpi-md-log__content');
+                        if (logContent && navigator.clipboard) {
+                            navigator.clipboard.writeText(logContent.textContent || '');
+                        }
                     }
                 } catch (err) {
                     Log.error(err);
