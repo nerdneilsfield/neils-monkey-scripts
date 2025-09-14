@@ -1,14 +1,14 @@
 // ==UserScript==
 // @name         MDPI Chapter to Markdown Exporter (Framework)
 // @namespace    http://tampermonkey.net/
-// @version      1.0.0
+// @version      1.0.1
 // @description  Export MDPI chapter pages to Markdown (Links/Base64/TextBundle) — Framework Only
 // @author       qiqi
 // @match        https://www.mdpi.com/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_addStyle
 // @grant        GM_setClipboard
-// @connect      link.springer.com
+// @connect      www.mdpi.com
 // @connect      media.springernature.com
 // @require      https://cdnjs.cloudflare.com/ajax/libs/jszip/3.9.1/jszip.min.js
 // @require      https://cdnjs.cloudflare.com/ajax/libs/turndown/7.1.2/turndown.min.js
@@ -101,6 +101,13 @@
         $all(sel, root) { return Array.from((root || document).querySelectorAll(sel)); },
         text(node) { return (node?.textContent || '').trim(); },
         attr(node, name) { return node?.getAttribute?.(name) || null; },
+        unescapeHtml(s) {
+            try {
+                const ta = document.createElement('textarea');
+                ta.innerHTML = String(s ?? '');
+                return ta.value;
+            } catch { return String(s ?? ''); }
+        },
 
         mergeSoftWraps(s) {
             return String(s || '')
@@ -407,76 +414,11 @@
                 a.replaceWith(document.createTextNode(Number.isInteger(n) ? `[^R${n}]` : ''));
             }
 
-            // 3) 算法表格特殊处理
-            for (const table of Array.from(root.querySelectorAll('table.html-array_table'))) {
-                const processAlgorithmContent = (text) => {
-                    // 提取 LaTeX 格式（在 $ 符号内的）并移除重复的纯文本
-                    // 例如：PosPixel←∅$PosPixel←∅$ → $PosPixel←∅$
-                    text = text.replace(/([^$\s]+[←∈≠∪]+[^$\s]*)\s*\$([^$]+)\$/g, (match, plain, latex) => {
-                        // 如果 LaTeX 内容包含相似的内容，只保留 LaTeX
-                        if (latex.includes(plain.substring(0, 3))) {
-                            return `$${latex}$`;
-                        }
-                        return match;
-                    });
+            // 3) 算法表格：不在行内处理，交由块级流程以嵌入 HTML 方式输出
 
-                    // 清理独立的 Unicode 数学符号
-                    text = text.replace(/([A-Za-z]+[←∈≠∪]+[A-Za-z∅]*)\s+/g, '');
-
-                    // 移除 <math> 标签
-                    text = text.replace(/<math[^>]*>[\s\S]*?<\/math>/g, '');
-
-                    // 合并空格
-                    text = text.replace(/\s+/g, ' ');
-
-                    return text.trim();
-                };
-
-                const algorithmTitle = table.querySelector('b')?.textContent || '';
-                const lines = [];
-
-                // 添加标题
-                if (algorithmTitle) {
-                    lines.push(algorithmTitle);
-                }
-
-                // 处理 Require 行
-                const requireText = table.textContent?.match(/Require:[^1]*/)?.[0];
-                if (requireText) {
-                    lines.push(processAlgorithmContent(requireText));
-                }
-
-                // 处理编号行
-                const rows = Array.from(table.querySelectorAll('dt, dd'));
-                if (rows.length > 0) {
-                    for (const row of rows) {
-                        const lineNum = row.parentElement?.querySelector('dt')?.textContent || '';
-                        const lineContent = (row.querySelector('.html-p')?.innerHTML || row.textContent || '').trim();
-                        const processed = processAlgorithmContent(lineContent);
-                        if (lineNum && processed) {
-                            lines.push(`${lineNum} ${processed}`);
-                        } else if (processed) {
-                            lines.push(processed);
-                        }
-                    }
-                } else {
-                    // 如果没有结构化的行，按行号分割
-                    const content = (table.textContent || '');
-                    const lineMatches = content.matchAll(/(\d+):\s*([^0-9][^\n]*?)(?=\d+:|$)/g);
-                    for (const match of lineMatches) {
-                        const processed = processAlgorithmContent(match[2]);
-                        if (processed) {
-                            lines.push(`${match[1]}: ${processed}`);
-                        }
-                    }
-                }
-
-                // 构建 Markdown 代码块，确保前后有空行
-                let markdown = '\n\n```algorithm\n';
-                markdown += lines.join('\n');
-                markdown += '\n```\n\n';
-
-                table.replaceWith(document.createTextNode(markdown));
+            // 3.5) 规范化其余区域的 MathJax（跳过上面已替换为代码块的算法表）
+            if (typeof this._normalizeMathInlines === 'function') {
+                this._normalizeMathInlines(root);
             }
 
             // 4) 处理公式区域（包括可能不完整的）
@@ -555,7 +497,7 @@
                 return '';
             };
 
-            // 6) 处理公式显示区域
+            // 6) 处理公式显示区域（保守：跳过仅为简单变量的情况）
             for (const div of Array.from(root.querySelectorAll('.html-disp-formula-info'))) {
                 const mjDisplay = div.querySelector('.MathJax_Display');
                 const label = div.querySelector('label')?.textContent || '';
@@ -563,6 +505,8 @@
                 if (mjDisplay) {
                     const tex = mjToTex(mjDisplay);
                     if (tex) {
+                        const core = tex.replace(/^\$+|\$+$/g, '').trim();
+                        if (/^[A-Za-z][A-Za-z0-9]{0,6}$/.test(core)) { div.remove(); continue; }
                         // 修正 \tag 格式
                         const replacement = tex.includes('$$')
                             ? tex.replace('$$', `$$ \\tag{${label}}`)
@@ -684,6 +628,18 @@
                         const p = document.createElement('p');
                         p.innerHTML = el.innerHTML; // 克隆其子结构（保留 <a>/<em>/<strong> 等行内格式）
 
+                        // 调试：检查段落中的算法表格数量
+                        const algorithmTables = p.querySelectorAll('table.html-array_table');
+                        if (algorithmTables.length > 0) {
+                            const titles = Array.from(algorithmTables).map(t => {
+                                const firstCell = t.querySelector('td, th');
+                                return firstCell ? firstCell.textContent.trim().substring(0, 50) + '...' : 'No title';
+                            });
+                            Log.info(`Found ${algorithmTables.length} algorithm table(s) in paragraph:`, titles);
+                        } else {
+                            Log.info('No algorithm tables found in paragraph');
+                        }
+
                         // 引文 a.html-bibr → [^Rn]
                         for (const a of Array.from(p.querySelectorAll('a.html-bibr[href^="#B"]'))) {
                             const href = a.getAttribute('href') || '';
@@ -691,9 +647,26 @@
                             if (Number.isInteger(n) && n > 0) a.replaceWith(document.createTextNode(`[^R${n}]`));
                         }
 
-                        // 行内 MathML → `$...$`
                         const pendingBlocks = [];
+
+                        // 先标记算法表格内的数学公式，避免被后续处理
+                        const algorithmsToExtract = Array.from(p.querySelectorAll('table.html-array_table'));
+                        Log.info(`Tables to extract: ${algorithmsToExtract.length}`);
+                        const mathInTables = new Set();
+                        for (const tbl of algorithmsToExtract) {
+                            for (const math of tbl.querySelectorAll('math')) {
+                                mathInTables.add(math);
+                            }
+                        }
+
+                        // 行内 MathML → `$...$` (先处理表格外的数学公式)
                         for (const m of Array.from(p.querySelectorAll('math'))) {
+                            // 跳过算法表格内的数学公式
+                            if (mathInTables.has(m)) {
+                                Log.info('Skipping math formula inside algorithm table');
+                                continue;
+                            }
+
                             const tex = this._mmlToTex(m);
                             if (!tex) continue;
                             const isBlock = (m.getAttribute('display') || '').toLowerCase() === 'block';
@@ -716,12 +689,31 @@
                             }
                         }
 
+                        // 算法表格：提取完整的表格（包含其内部的数学公式）
+                        for (const t of algorithmsToExtract) {
+                            try {
+                                const tbl = t.closest('table') || t;
+                                const blk = tbl.cloneNode(true);
+                                pendingBlocks.push(blk);
+                                if (typeof tbl.remove === 'function') tbl.remove();
+                                else if (tbl.parentNode) tbl.parentNode.removeChild(tbl);
+                                const firstCell = tbl.querySelector('td, th');
+                                const title = firstCell ? firstCell.textContent.trim().substring(0, 30) : 'Unknown';
+                                Log.info(`Extracted algorithm table: "${title}..."`);
+                            } catch (e) {
+                                Log.warn('Failed to extract algorithm table:', e);
+                            }
+                        }
+
+                        Log.info(`Total pending blocks: ${pendingBlocks.length}`);
+                        const blockTypes = pendingBlocks.map(b => b.tagName || 'unknown');
+                        Log.info('Pending block types:', blockTypes);
 
                         // 空段落过滤
                         const txt = (p.textContent || '').trim();
                         if (txt) nodes.push(p);
 
-                        // 把块级公式紧跟着这个段落入列（保证不乱序、也不卡在段首）
+                        // 把块级公式/算法表紧跟着这个段落入列（保证不乱序、也不卡在段首）
                         for (const blk of pendingBlocks) nodes.push(blk);
 
                         continue;
@@ -736,8 +728,27 @@
                         continue;
                     }
 
-                    // 表（原生 <table> 直接交给 extractTable）
-                    if (/^table$/i.test(el.tagName)) { nodes.push(el); continue; }
+                    // 表（原生 <table>）
+                    if (/^table$/i.test(el.tagName)) {
+                        // 检查是否为算法表格
+                        if (el.matches && el.matches('table.html-array_table')) {
+                            const firstCell = el.querySelector('td, th');
+                            const title = firstCell ? firstCell.textContent.trim().substring(0, 30) : 'Unknown';
+                            Log.info(`Found algorithm table at section level: "${title}..."`);
+                            // 用算法表格的方式处理
+                            try {
+                                const blk = el.cloneNode(true);
+                                nodes.push(blk);
+                                Log.info(`Added section-level algorithm table to nodes`);
+                            } catch (e) {
+                                Log.warn('Failed to process section-level algorithm table:', e);
+                            }
+                        } else {
+                            // 普通表格处理
+                            nodes.push(el);
+                        }
+                        continue;
+                    }
 
                     // 列表/代码
                     if (/^(ul|ol|pre)$/i.test(el.tagName)) { nodes.push(el); continue; }
@@ -752,6 +763,11 @@
 
         // —— 提取：块级方程 ——（给 Controller 分支使用；MDPI 多为 <math>，仍兜底支持）
         extractEquationBlock(node) {
+            // Don't treat algorithm tables as equation blocks
+            if (this.isAlgorithmTable && this.isAlgorithmTable(node)) {
+                return null;
+            }
+            
             const m = node?.querySelector?.('math') || null;
             if (!m) return null;
             const tex = this._mmlToTex(m);
@@ -825,6 +841,148 @@
             }
 
             return { markdown: lines.join('\n') };
+        }
+
+        // —— 检测：是否为“算法表格” —— //
+        isAlgorithmTable(node) {
+            Log.info(`isAlgorithmTable called - node: ${node?.tagName || 'null'}, classes: ${node?.className || 'no-class'}`);
+            if (!node) {
+                Log.info(`isAlgorithmTable result: false (no node)`);
+                return false;
+            }
+            // 直接匹配自身为算法结构
+            if (node.matches && node.matches('table.html-array_table, dl.html-order')) {
+                Log.info(`isAlgorithmTable result: true (direct match)`);
+                return true;
+            }
+            // 向下查找表格或步骤清单
+            const el = (node.tagName?.toLowerCase() === 'table') ? node : (node.querySelector?.('table') || node.querySelector?.('dl.html-order'));
+            if (!el) {
+                Log.info(`isAlgorithmTable result: false (no table/dl element found)`);
+                return false;
+            }
+            if (el.classList && el.classList.contains('html-array_table')) {
+                Log.info(`isAlgorithmTable result: true (has html-array_table class)`);
+                return true;
+            }
+            if (el.matches && el.matches('dl.html-order')) {
+                Log.info(`isAlgorithmTable result: true (matches dl.html-order)`);
+                return true;
+            }
+            const text = (el.textContent || '').toLowerCase();
+            if (/\balgorithm\s*\d+\b/.test(text)) {
+                Log.info(`isAlgorithmTable result: true (contains "algorithm N" text)`);
+                return true;
+            }
+            Log.info(`isAlgorithmTable result: false (no criteria matched)`);
+            return false;
+        }
+
+        // —— 抽取：算法表格（保持嵌入 HTML，但把单元格 MathJax/MML 转为纯文本）—— //
+        extractAlgorithmTable(node) {
+            Log.info(`extractAlgorithmTable called - input node: ${node.tagName}, classes: ${node.className || 'no-class'}`);
+            const table = node.tagName?.toLowerCase() === 'table' ? node : node.querySelector?.('table');
+            if (!table) return { html: node.outerHTML };
+            const clone = table.cloneNode(true);
+            const toText = (el) => String(el?.textContent || '').replace(/\s+/g, ' ').trim();
+
+            // 工具：在文本节点层面移除 $...$ 外壳
+            const stripDollarInTextNodes = (rootEl) => {
+                const walker = document.createTreeWalker(rootEl, NodeFilter.SHOW_TEXT, null);
+                const texts = [];
+                let n; while ((n = walker.nextNode())) texts.push(n);
+                for (const t of texts) {
+                    const s = String(t.nodeValue || '');
+                    const r = s.replace(/\$([^$]+)\$/g, '$1');
+                    if (r !== s) t.nodeValue = r;
+                }
+            };
+
+            // 1) 将 MathJax/MML 元素替换为正确的数学公式格式
+            for (const mj of Array.from(clone.querySelectorAll('span.MathJax'))) {
+                let tex = '';
+                try {
+                    const assist = mj.querySelector('.MJX_Assistive_MathML math');
+                    if (assist) tex = this._mmlToTex(assist) || '';
+                } catch {}
+                if (!tex) {
+                    const mmlStr = mj.getAttribute('data-mathml');
+                    if (mmlStr) {
+                        try {
+                            const doc = new DOMParser().parseFromString(mmlStr, 'application/xml');
+                            tex = this._mmlToTex(doc.documentElement) || '';
+                        } catch {}
+                    }
+                }
+                if (tex) {
+                    // 保持数学公式的正确格式
+                    const replacement = `$${tex}$`; // MathJax通常是行内公式
+                    mj.replaceWith(document.createTextNode(replacement));
+                } else {
+                    const plain = toText(mj);
+                    mj.replaceWith(document.createTextNode(plain));
+                }
+            }
+            for (const m of Array.from(clone.querySelectorAll('math'))) {
+                const tex = this._mmlToTex(m);
+                if (tex) {
+                    // 保持数学公式的正确格式
+                    const isInline = (m.getAttribute('display') || '').toLowerCase() !== 'block';
+                    const replacement = isInline ? `$${tex}$` : `$$${tex}$$`;
+                    m.replaceWith(document.createTextNode(replacement));
+                } else {
+                    const plain = toText(m);
+                    m.replaceWith(document.createTextNode(plain));
+                }
+            }
+            // 移除 MathJax 相关与 nobr 残留
+            clone.querySelectorAll('script[type="math/mml"], script[type^="math/tex"], .MathJax_Preview, .MJX_Assistive_MathML').forEach(n => n.remove());
+            for (const nobr of Array.from(clone.querySelectorAll('nobr, span.math'))) {
+                // 尝试从 span.math 中提取数学公式
+                if (nobr.classList && nobr.classList.contains('math')) {
+                    const mathEl = nobr.querySelector('math');
+                    if (mathEl) {
+                        const tex = this._mmlToTex(mathEl);
+                        if (tex) {
+                            nobr.replaceWith(document.createTextNode(`$${tex}$`));
+                            continue;
+                        }
+                    }
+                }
+                nobr.replaceWith(document.createTextNode(toText(nobr)));
+            }
+
+            // 2) 单元格层面规范化：去 $，合并分散字母，去重（但不扁平化标签）
+            for (const cell of Array.from(clone.querySelectorAll('td, th'))) {
+                // 去除 $...$
+                stripDollarInTextNodes(cell);
+                // 合并分散字母
+                const walker = document.createTreeWalker(cell, NodeFilter.SHOW_TEXT, null);
+                const texts = [];
+                let tn; while ((tn = walker.nextNode())) texts.push(tn);
+                for (const t of texts) {
+                    t.nodeValue = String(t.nodeValue || '').replace(/\b(?:[A-Za-z]\s){2,}[A-Za-z]\b/g, s => s.replace(/\s+/g, ''));
+                }
+                // 去除紧邻重复词/短语
+                let html = cell.innerHTML
+                    .replace(/\b([A-Za-z]{2,})\s*\1\b/g, '$1')
+                    .replace(/([A-Za-z][A-Za-z0-9]*[←∈≠∪≤≥⋅·→↔∅≠=±√]*)(?:\s*\1)+/g, '$1')
+                    .replace(/\s+$/g, '');
+                // 解码实体
+                try { html = U.unescapeHtml(html); } catch {}
+                cell.innerHTML = html;
+            }
+
+            // 3) 为 dl 步骤添加最小内联样式，尽量还原布局
+            for (const dl of Array.from(clone.querySelectorAll('dl.html-order'))) {
+                dl.setAttribute('style', 'margin:0;');
+                for (const dt of Array.from(dl.querySelectorAll(':scope > dt'))) dt.setAttribute('style', 'display:inline-block;width:2.2em;margin:0;vertical-align:top;');
+                for (const dd of Array.from(dl.querySelectorAll(':scope > dd'))) dd.setAttribute('style', 'display:block;margin:0 0 0 2.4em;');
+            }
+            
+            Log.info(`extractAlgorithmTable output - HTML length: ${clone.outerHTML.length}`);
+            Log.info(`extractAlgorithmTable HTML preview: ${clone.outerHTML.substring(0, 100)}...`);
+            return { html: clone.outerHTML };
         }
 
         // —— 单元格 → 纯文本/内联 HTML（保留 sub/sup/em/strong/code，处理行内公式/脚注/链接） —— //
@@ -989,8 +1147,16 @@
 
         emitParagraph(text) {
             if (!text) return;
-            this.buffers.body.push(U.mergeSoftWraps(String(text)));
-            this.buffers.body.push('');
+            const s = String(text);
+            if (/```/.test(s)) {
+                // 保留内含代码块的原始换行，并确保前后空行
+                this._ensureBlockGap();
+                this.buffers.body.push(s.trim());
+                this.buffers.body.push('');
+            } else {
+                this.buffers.body.push(U.mergeSoftWraps(s));
+                this.buffers.body.push('');
+            }
         }
 
         emitMath(math) {
@@ -1038,9 +1204,11 @@
 
             // 直接嵌入 HTML（CommonMark/GFM/Typora/Obsidian 都支持块级 HTML）
             if (table.html) {
-                this._ensureBlockGap();
+                // 强制成为独立块：表前至少两行分隔，表后至少一行分隔
+                this._ensureBlockGap();      // 确保至少 1 个空行
+                this.buffers.body.push('');   // 再补 1 个空行 → 共两个 \n
                 this.buffers.body.push(String(table.html).trim());
-                this.buffers.body.push('');
+                this.buffers.body.push('');   // 表后留 1 个空行
                 return;
             }
 
@@ -1614,8 +1782,9 @@
                 Log.info('Using cached links mode markdown...');
                 return this._cache.baseMarkdown;
             } else {
-                Log.info('Processing mode-specific logic for:', mode);
-                return await this._regenerateWithModeSpecificLogic(mode);
+                // 其它模式：直接走原始完整流程，确保资源/图片等逻辑正确
+                Log.info('Running original pipeline for mode:', mode);
+                return await this._originalRunPipeline(mode);
             }
         }
 
@@ -1658,13 +1827,23 @@
                 this.emitter.emitHeading(sec.level || 2, sec.title || 'Section', sec.anchor);
 
                 for (const node of (sec.nodes || [])) {
-                    // —— 优先尝试“站点无关”的块级公式抽取 —— //
+                    // —— 优先尝试"站点无关"的块级公式抽取 —— //
                     if (this.adapter.extractEquationBlock) {
                         const em = this.adapter.extractEquationBlock(node);
                         if (em) { this.emitter.emitMath(em); continue; }
                     }
 
                     const tag = (node.tagName || '').toLowerCase();
+
+                    // —— 优先：算法表格（即使节点不是 table，本函数也能向下查询）—— //
+                    if (this.adapter.isAlgorithmTable && this.adapter.isAlgorithmTable(node)) {
+                        Log.info(`Processing algorithm table in Controller, node tag: ${node.tagName}`);
+                        const t = this.adapter.extractAlgorithmTable(node);
+                        Log.info(`Algorithm table extracted - HTML length: ${t.html ? t.html.length : 0}`);
+                        Log.info(`Algorithm table HTML preview: ${t.html ? t.html.substring(0, 200) : 'empty'}...`);
+                        this.emitter.emitTable({ html: t.html });
+                        continue;
+                    }
 
                     // —— 段落（支持 adapter.transformParagraph 钩子）—— //
                     if (tag === 'p') {
@@ -1682,7 +1861,7 @@
                         continue;
                     }
 
-                    // —— 表：容器 + “表样式figure” + 原生 <table> —— //
+                    // —— 表：一般表格 —— //
                     if (
                         (node.matches && (
                             (this.adapter.isTableContainer && this.adapter.isTableContainer(node)) ||
@@ -1690,7 +1869,9 @@
                         )) ||
                         tag === 'table'
                     ) {
+                        Log.info(`Processing general table in Controller - tag: ${tag}, className: ${node.className || 'no-class'}`);
                         const t = await this.adapter.extractTable(node);
+                        Log.info(`General table extracted - HTML length: ${t.html ? t.html.length : 0}`);
                         this.emitter.emitTable(t);
                         continue;
                     }
@@ -1759,6 +1940,7 @@
                     }
 
                     // —— 最后兜底纯文本 —— //
+                    Log.warn(`Node not processed by any main branch - tag: ${node.tagName}, className: ${node.className || 'no-class'}, id: ${node.id || 'no-id'}`);
                     const fallback = (node.textContent || '').trim();
                     if (fallback) {
                         if (typeof this.adapter.transformInline === 'function') {
@@ -1874,8 +2056,9 @@
             this._cache.citationMap = citeMap;
             this._cache.sections = sections;
             
-            // 生成基础Markdown（使用links模式的完整原始逻辑）
-            this._cache.baseMarkdown = await this._generateBaseCacheMarkdown(meta, bib, citeMap, sections);
+            // 生成基础Markdown：直接使用原始完整流程（links 模式）
+            // 避免调用尚未实现的适配器/发射器快捷方法
+            this._cache.baseMarkdown = await this._originalRunPipeline('links');
             
             Log.info('Base cache built successfully');
         }
@@ -2036,6 +2219,171 @@
             };
             Array.from(root.childNodes).forEach(walk);
             return out.join('');
+        }
+
+        // 把 MathJax/MML 内联公式转换为 $...$
+        _normalizeMathInlines(root) {
+            // 移除预览节点
+            for (const pv of Array.from(root.querySelectorAll('.MathJax_Preview'))) pv.remove();
+
+            const mmlToTex = (mmlEl) => {
+                try {
+                    return this._mmlToTex(mmlEl) || null;
+                } catch { return null; }
+            };
+
+            // 1) 处理 MathJax 渲染产物（span.MathJax）
+            for (const mj of Array.from(root.querySelectorAll('span.MathJax'))) {
+                let tex = null;
+                // a) data-mathml 属性
+                const mmlStr = mj.getAttribute('data-mathml');
+                if (mmlStr) {
+                    try {
+                        const doc = new DOMParser().parseFromString(mmlStr, 'application/xml');
+                        const mathEl = doc.querySelector('math');
+                        if (mathEl) tex = mmlToTex(mathEl);
+                    } catch {}
+                }
+                // b) 无 data-mathml，用无障碍 MathML
+                if (!tex) {
+                    const assist = mj.querySelector('.MJX_Assistive_MathML math');
+                    if (assist) tex = mmlToTex(assist);
+                }
+                // c) 再兜底：同 id 的 script[type="math/mml"]
+                if (!tex) {
+                    const sid = (mj.id || '').replace(/-Frame$/, '');
+                    if (sid) {
+                        let sc = null;
+                        try {
+                            sc = root.querySelector(`script[type="math/mml"][id="${sid}"]`) || root.querySelector(`script[type="math/mml"][id^="${sid}"]`);
+                        } catch { /* ignore */ }
+                        if (sc && sc.textContent) {
+                            try {
+                                const doc = new DOMParser().parseFromString(sc.textContent, 'application/xml');
+                                const mathEl = doc.querySelector('math');
+                                if (mathEl) tex = mmlToTex(mathEl);
+                            } catch {}
+                        }
+                    }
+                }
+
+                if (tex) {
+                    mj.replaceWith(document.createTextNode(`$${tex}$`));
+                } else {
+                    mj.replaceWith(document.createTextNode(''));
+                }
+            }
+
+            // 2) 处理遗留的 <script type="math/mml">
+            for (const sc of Array.from(root.querySelectorAll('script[type="math/mml"]'))) {
+                const xml = sc.textContent || '';
+                let tex = null;
+                if (xml.trim()) {
+                    try {
+                        const doc = new DOMParser().parseFromString(xml, 'application/xml');
+                        const mathEl = doc.querySelector('math');
+                        if (mathEl) tex = mmlToTex(mathEl);
+                    } catch {}
+                }
+                sc.replaceWith(document.createTextNode(tex ? `$${tex}$` : ''));
+            }
+
+            // 3) 处理 <script type="math/tex">
+            for (const sc of Array.from(root.querySelectorAll('script[type^="math/tex"]'))) {
+                const isDisplay = /mode=display/i.test(sc.getAttribute('type') || '');
+                const tex = (sc.textContent || '').trim();
+                sc.replaceWith(document.createTextNode(isDisplay ? `$$\n${tex}\n$$` : `$${tex}$`));
+            }
+
+            // 4) 直接内联的 <math>
+            for (const m of Array.from(root.querySelectorAll('math'))) {
+                const tex = mmlToTex(m);
+                if (tex) m.replaceWith(document.createTextNode(`$${tex}$`));
+            }
+        }
+
+        // —— 新增：把 MathJax/MML 内联公式转换为 $...$ —— //
+        _normalizeMathInlines(root) {
+            // 移除预览节点
+            for (const pv of Array.from(root.querySelectorAll('.MathJax_Preview'))) pv.remove();
+
+            const mmlToTex = (mmlEl) => {
+                try {
+                    return this._mmlToTex(mmlEl) || null;
+                } catch { return null; }
+            };
+
+            // 1) 处理 MathJax 渲染产物（span.MathJax）
+            for (const mj of Array.from(root.querySelectorAll('span.MathJax'))) {
+                let tex = null;
+                // a) data-mathml 属性（最可靠）
+                const mmlStr = mj.getAttribute('data-mathml');
+                if (mmlStr) {
+                    try {
+                        const doc = new DOMParser().parseFromString(mmlStr, 'application/xml');
+                        const mathEl = doc.querySelector('math');
+                        if (mathEl) tex = mmlToTex(mathEl);
+                    } catch {}
+                }
+                // b) 无 data-mathml，则找无障碍 MathML 镶嵌
+                if (!tex) {
+                    const assist = mj.querySelector('.MJX_Assistive_MathML math');
+                    if (assist) tex = mmlToTex(assist);
+                }
+                // c) 仍无，则最后兜底：试图取附近 script[type="math/mml"]
+                if (!tex) {
+                    const sid = (mj.id || '').replace(/-Frame$/, '');
+                    if (sid) {
+                        let sc = null;
+                        try {
+                            sc = root.querySelector(`script[type="math/mml"][id="${sid}"]`) || root.querySelector(`script[type="math/mml"][id^="${sid}"]`);
+                        } catch { /* ignore selector errors */ }
+                        if (sc && sc.textContent) {
+                            try {
+                                const doc = new DOMParser().parseFromString(sc.textContent, 'application/xml');
+                                const mathEl = doc.querySelector('math');
+                                if (mathEl) tex = mmlToTex(mathEl);
+                            } catch {}
+                        }
+                    }
+                }
+
+                if (tex) {
+                    mj.replaceWith(document.createTextNode(`$${tex}$`));
+                } else {
+                    // 兜底：把其可见文本直接移除（避免花体字符污染正文）
+                    mj.replaceWith(document.createTextNode(''));
+                }
+            }
+
+            // 2) 处理遗留的 <script type="math/mml">（MathJax 源 MathML）
+            for (const sc of Array.from(root.querySelectorAll('script[type="math/mml"]'))) {
+                const xml = sc.textContent || '';
+                let tex = null;
+                if (xml.trim()) {
+                    try {
+                        const doc = new DOMParser().parseFromString(xml, 'application/xml');
+                        const mathEl = doc.querySelector('math');
+                        if (mathEl) tex = mmlToTex(mathEl);
+                    } catch {}
+                }
+                sc.replaceWith(document.createTextNode(tex ? `$${tex}$` : ''));
+            }
+
+            // 3) 处理 <script type="math/tex">（少量站点会残留）
+            for (const sc of Array.from(root.querySelectorAll('script[type^="math/tex"]'))) {
+                const isDisplay = /mode=display/i.test(sc.getAttribute('type') || '');
+                const tex = (sc.textContent || '').trim();
+                const trivial = /^[A-Za-z][A-Za-z0-9]{0,6}$/.test(tex);
+                const repl = (isDisplay && !trivial) ? `$$\n${tex}\n$$` : `$${tex}$`;
+                sc.replaceWith(document.createTextNode(repl));
+            }
+
+            // 4) 直接内联的 <math>（行内 MathML）
+            for (const m of Array.from(root.querySelectorAll('math'))) {
+                const tex = mmlToTex(m);
+                if (tex) m.replaceWith(document.createTextNode(`$${tex}$`));
+            }
         }
 
         _renderList(listNode, citeMap, depth = 0) {
