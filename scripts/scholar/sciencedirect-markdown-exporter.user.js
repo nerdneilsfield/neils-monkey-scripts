@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ScienceDirect Paper to Markdown Exporter (Enhanced)
 // @namespace    http://tampermonkey.net/
-// @version      1.0.0
+// @version      1.0.1
 // @description  Export ScienceDirect papers to Markdown with complete metadata, TextBundle and Base64 formats
 // @author       Qi Deng <dengqi935@gmail.com>
 // @match        https://www.sciencedirect.com/science/article/pii/*
@@ -12,6 +12,7 @@
 // @grant        GM_addStyle
 // @connect      sciencedirect.com
 // @connect      ars.els-cdn.com
+// @run-at       document-idle
 // @downloadURL https://github.com/nerdneilsfield/neils-monkey-scripts/raw/refs/heads/master/scripts/scholar/sciencedirect-markdown-exporter.user.js
 // @updateURL https://github.com/nerdneilsfield/neils-monkey-scripts/raw/refs/heads/master/scripts/scholar/sciencedirect-markdown-exporter.user.js
 // ==/UserScript==
@@ -254,6 +255,8 @@
 
       const authors = this._parseAuthors();
       const abstract = this._parseAbstract();
+      const highlights = this._parseHighlights();
+      const keywords = this._parseKeywords();
       
       // Extract DOI from page
       const doiLink = this._$("a.doi[href*='doi.org']");
@@ -278,7 +281,9 @@
         volume: journalInfo.volume,
         pages: journalInfo.pages,
         year: journalInfo.year,
-        doi: doi
+        doi: doi,
+        highlights,
+        keywords
       };
     }
 
@@ -384,8 +389,8 @@
         }
       }
 
-      // 再扫描正文中出现的 cite/ref，补充未知形式
-      const anchors = this._all('a[href*="#bib"]');
+      // 再扫描正文中出现的 cite/ref，补充未知形式（不同模板：#bibNN, #b0005, data-xocs-content-type="reference"）
+      const anchors = this._all('a[href*="#bib"], a[href^="#b"], a[data-xocs-content-type="reference"]');
       for (const a of anchors) {
         const href = a.getAttribute("href") || "";
         const key = this._normalizeBibHref(href);
@@ -405,8 +410,8 @@
         this._text(this._$(".title-text"))
       );
 
-      // ScienceDirect sections: #sec1, #sec2, etc.
-      const SEC_SEL = 'section[id^="sec"]';
+      // ScienceDirect sections: old OA uses id^=sec, non-OA often id^=s (e.g., s0005)
+      const SEC_SEL = 'section[id^="sec"], section[id^="s"]';
       const sections = this._all(SEC_SEL);
       const seen = new Set();
       const out = [];
@@ -428,7 +433,9 @@
         // 仅采集“直属当前 sec”的节点；排除落在任何子 section 里的节点
         const NODE_SEL = [
           "div[id^='p']", // ScienceDirect paragraphs
-          "figure[id^='fig']", // Figures
+          "figure[id^='f']", // Figures (non-OA: f0005)
+          "figure[id^='fig']", // Figures (OA: fig1)
+          "figure.figure", // Generic figure block
           "div.tables[id^='tbl']", // Tables  
           'math[display="block"]', // Math equations
           "ul", // Unordered lists
@@ -532,11 +539,41 @@
         const downloadLinks = Array.from(clone.querySelectorAll('a[href*="image"], a.download-link, .download-link'));
         downloadLinks.forEach(link => link.remove());
         
-        // Process any math content
-        for (const m of Array.from(clone.querySelectorAll("math"))) {
-          const tex = this._extractTeX(m);
-          m.replaceWith(document.createTextNode(tex ? `$${tex}$` : ""));
+        const hasMathJax = clone.querySelector('span.MathJax_SVG, span.MJX_Assistive_MathML');
+        if (hasMathJax) {
+          // Prefer converting MathJax-rendered nodes and drop raw <math> to avoid duplicates
+          for (const svg of Array.from(clone.querySelectorAll('span.MathJax_SVG'))) {
+            let tex = "";
+            const mml = svg.getAttribute('data-mathml');
+            if (mml) {
+              try {
+                const doc = new DOMParser().parseFromString(mml, 'application/xml');
+                const mathEl = doc.querySelector('math');
+                if (mathEl) tex = this._extractTeX(mathEl) || "";
+              } catch {}
+            }
+            if (!tex) {
+              const assist = svg.parentElement?.querySelector('span.MJX_Assistive_MathML math');
+              if (assist) tex = this._extractTeX(assist) || "";
+            }
+            if (tex) {
+              const isDisplay = !!(svg.closest('.display') || svg.closest('span.display'));
+              svg.replaceWith(document.createTextNode(isDisplay ? `$$${tex}$$` : `$${tex}$`));
+            }
+          }
+          // Remove any raw <math> to avoid duplicated math content
+          for (const m of Array.from(clone.querySelectorAll('math'))) m.remove();
+        } else {
+          // Convert raw <math> elements to TeX
+          for (const m of Array.from(clone.querySelectorAll("math"))) {
+            const tex = this._extractTeX(m);
+            m.replaceWith(document.createTextNode(tex ? `$${tex}$` : ""));
+          }
         }
+        // Remove MathJax scaffolding nodes
+        for (const junk of Array.from(
+          clone.querySelectorAll('script[type="math/mml"], span.MathJax_SVG, span.MJX_Assistive_MathML, span.MathJax_Preview')
+        )) junk.remove();
         const fullText = this._mergeSoftWraps(clone.textContent || "");
         
         // Extract figure number and caption
@@ -693,6 +730,39 @@
     _cleanTableHtml(table) {
       const clone = table.cloneNode(true);
 
+      // 转换表格/标题中的数学：优先 MathJax，否则 <math> → $...$
+      const hasMj = clone.querySelector('span.MathJax_SVG, span.MJX_Assistive_MathML');
+      if (hasMj) {
+        for (const svg of Array.from(clone.querySelectorAll('span.MathJax_SVG'))) {
+          let tex = "";
+          const mml = svg.getAttribute('data-mathml');
+          if (mml) {
+            try {
+              const doc = new DOMParser().parseFromString(mml, 'application/xml');
+              const mathEl = doc.querySelector('math');
+              if (mathEl) tex = this._extractTeX(mathEl) || "";
+            } catch {}
+          }
+          if (!tex) {
+            const assist = svg.parentElement?.querySelector('span.MJX_Assistive_MathML math');
+            if (assist) tex = this._extractTeX(assist) || "";
+          }
+          if (tex) {
+            const isDisplay = !!(svg.closest('.display') || svg.closest('span.display'));
+            svg.replaceWith(document.createTextNode(isDisplay ? `$$${tex}$$` : `$${tex}$`));
+          }
+        }
+        for (const m of Array.from(clone.querySelectorAll('math'))) m.remove();
+      } else {
+        for (const m of Array.from(clone.querySelectorAll('math'))) {
+          const tex = this._extractTeX(m);
+          m.replaceWith(document.createTextNode(tex ? `$${tex}$` : ""));
+        }
+      }
+      for (const junk of Array.from(
+        clone.querySelectorAll('script[type="math/mml"], span.MathJax_SVG, span.MJX_Assistive_MathML, span.MathJax_Preview')
+      )) junk.remove();
+
       // 移除LaTeX特定的类名，保留基本结构类
       const elements = clone.querySelectorAll("*");
       elements.forEach((el) => {
@@ -754,42 +824,63 @@
      */
     _parseAuthors() {
       const authors = [];
-      const box = this._$(".AuthorGroups");
+      const box = this._$(".AuthorGroups, .author-group, #author-group");
       if (!box) return authors;
 
-      // ScienceDirect structure: author links with .given-name and .surname
-      const authorLinks = this._all("a[href*='/author/']", box);
-      
-      for (const link of authorLinks) {
-        const givenName = this._text(this._$(".given-name", link)) || "";
-        const surname = this._text(this._$(".surname", link)) || "";
-        const name = `${givenName} ${surname}`.trim();
-        
-        if (name) {
-          // Look for affiliation markers (superscript)
-          const affMarker = this._text(this._$(".author-ref sup", link)) || "";
-          
-          authors.push({
-            name: name,
-            aff: affMarker ? `(${affMarker})` : undefined,
-            mail: undefined // ScienceDirect doesn't typically expose emails directly
-          });
+      // Build affiliation map: code (a,b,1,2) -> text
+      const affMap = new Map();
+      let affDls = this._all('dl.affiliation', box);
+      if (!affDls.length) affDls = this._all('dl.affiliation'); // fallback to document
+      const normCode = (s) => {
+        const m = String(s || '').toLowerCase().match(/([a-z0-9]+)/);
+        return m ? m[1] : String(s || '').trim().toLowerCase();
+      };
+      for (const dl of affDls) {
+        const codeRaw = this._text(this._$('dt sup', dl) || this._$('dt', dl)).trim();
+        const code = normCode(codeRaw);
+        const text = this._mergeSoftWraps(this._text(this._$('dd', dl)) || "");
+        if (code && text) {
+          affMap.set(code, text);
+          // also map uppercase variant for safety
+          affMap.set(code.toUpperCase(), text);
         }
       }
 
-      // Fallback: if no author links found, try to extract from text content
-      if (authorLinks.length === 0) {
+      // Collect author nodes: anchors and buttons
+      const nodes = [
+        ...this._all("a[href*='/author/']", box),
+        ...this._all("button[data-xocs-content-type='author']", box),
+      ];
+
+      for (const node of nodes) {
+        const givenName = this._text(this._$(".given-name", node)) || "";
+        const surname = this._text(this._$(".surname", node)) || "";
+        const name = `${givenName} ${surname}`.trim();
+        if (!name) continue;
+
+        // affiliation codes may appear multiple times
+        const codes = Array.from(node.querySelectorAll('.author-ref sup'))
+          .map((s) => normCode(this._mergeSoftWraps(s.textContent || "").trim()))
+          .filter(Boolean);
+        const uniqCodes = Array.from(new Set(codes));
+        const affTexts = uniqCodes.map((c) => affMap.get(c) || affMap.get(c.toUpperCase())).filter(Boolean);
+        const aff = affTexts.length ? affTexts.join('; ') : (uniqCodes.length ? `(${uniqCodes.join(',')})` : undefined);
+
+        authors.push({ name, aff, mail: undefined });
+      }
+
+      // Fallback: if no nodes found, try to split box text (best-effort)
+      if (nodes.length === 0) {
         const authorText = this._text(box);
         if (authorText) {
-          const names = authorText.split(/,|\band\b/).map(n => n.trim()).filter(Boolean);
-          for (const name of names) {
-            if (name && !name.includes('Author links')) {
-              authors.push({ name: name });
-            }
-          }
+          const names = authorText
+            .replace(/Author links open overlay panel/gi, '')
+            .split(/,|\band\b/)
+            .map((n) => n.trim())
+            .filter(Boolean);
+          for (const n of names) authors.push({ name: n });
         }
       }
-
 
       return authors;
     }
@@ -799,22 +890,104 @@
      * @returns {string}
      */
     _parseAbstract() {
-      const box = this._$("#abs0010");
-      if (!box) return "";
-      
-      // Look for abstract content in #abspara0010 or similar
-      const abstractPara = this._$("#abspara0010", box) || box;
-      let abs = this._text(abstractPara);
-      
-      if (!abs) {
-        // Fallback: collect all text content from the abstract section
-        abs = this._text(box);
+      // Prefer non-OA structure
+      const abstractsBox = this._$(".Abstracts, #abstracts");
+      if (abstractsBox) {
+        // Prefer the true author abstract, avoid author-highlights
+        const authorAbs = this._$(".abstract.author", abstractsBox) || this._$(".abstract:not(.author-highlights)", abstractsBox);
+        const toText = (node) => {
+          if (!node) return "";
+          const clone = node.cloneNode(true);
+          // convert inline math
+          for (const m of Array.from(clone.querySelectorAll('math'))) {
+            const tex = this._extractTeX(m);
+            m.replaceWith(document.createTextNode(tex ? `$${tex}$` : ""));
+          }
+          for (const svg of Array.from(clone.querySelectorAll('span.MathJax_SVG'))) {
+            let tex = "";
+            const mml = svg.getAttribute('data-mathml');
+            if (mml) {
+              try {
+                const doc = new DOMParser().parseFromString(mml, 'application/xml');
+                const mathEl = doc.querySelector('math');
+                if (mathEl) tex = this._extractTeX(mathEl) || "";
+              } catch {}
+            }
+            if (!tex) {
+              const assist = svg.parentElement?.querySelector('span.MJX_Assistive_MathML math');
+              if (assist) tex = this._extractTeX(assist) || "";
+            }
+            if (tex) svg.replaceWith(document.createTextNode(`$${tex}$`));
+          }
+          for (const junk of Array.from(
+            clone.querySelectorAll('script[type="math/mml"], span.MathJax_SVG, span.MJX_Assistive_MathML, span.MathJax_Preview')
+          )) junk.remove();
+          // anchors to text
+          for (const a of Array.from(clone.querySelectorAll('a'))) {
+            a.replaceWith(document.createTextNode(a.textContent || ""));
+          }
+          return this._mergeSoftWraps(clone.textContent || "");
+        };
+        if (authorAbs) {
+          // Target non-OA structure: container #asXXXX > div[id^=sp]
+          const as = this._$("[id^='as']", authorAbs) || authorAbs;
+          const paras = this._all("div[id^='sp'], p", as);
+          if (paras.length) {
+            const lines = paras.map((p) => this._mergeSoftWraps(toText(p)).replace(/^[•\-\*]\s*/, '')).filter(Boolean);
+            const body = lines.join(' ');
+            return body.replace(/^\s*Abstract\.?\s*/i, '').trim();
+          }
+          const body = this._mergeSoftWraps(toText(authorAbs));
+          return body.replace(/^\s*Abstract\.?\s*/i, '').trim();
+        }
       }
-      
-      abs = this._mergeSoftWraps(abs);
-      // Remove "Abstract" header if present
-      abs = abs.replace(/^\s*Abstract\.?\s*/i, "").trim();
-      return abs;
+      // Fallback old structure (#abs0010)
+      const box = this._$("#abs0010");
+      if (box) {
+        const abstractPara = this._$("#abspara0010", box) || box;
+        let abs = this._mergeSoftWraps(this._text(abstractPara) || this._text(box));
+        abs = abs.replace(/^\s*Abstract\.?\s*/i, "").trim();
+        return abs;
+      }
+      return "";
+    }
+
+    _parseHighlights() {
+      const out = [];
+      const abstractsBox = this._$(".Abstracts, #abstracts");
+      if (!abstractsBox) return out;
+      const hl = this._$(".abstract.author-highlights, .author-highlights", abstractsBox);
+      if (!hl) return out;
+      const items = this._all('li', hl);
+      for (const it of items) {
+        const clone = it.cloneNode(true);
+        for (const a of Array.from(clone.querySelectorAll('a'))) a.replaceWith(document.createTextNode(a.textContent || ""));
+        for (const m of Array.from(clone.querySelectorAll('math'))) {
+          const tex = this._extractTeX(m);
+          m.replaceWith(document.createTextNode(tex ? `$${tex}$` : ""));
+        }
+        for (const junk of Array.from(
+          clone.querySelectorAll('script[type="math/mml"], span.MathJax_SVG, span.MJX_Assistive_MathML, span.MathJax_Preview')
+        )) junk.remove();
+        const t = this._mergeSoftWraps(this._text(clone)).replace(/^[•\-\*]\s*/, '').trim();
+        if (t) out.push(t);
+      }
+      // Deduplicate consecutive duplicates
+      return Array.from(new Set(out));
+    }
+
+    _parseKeywords() {
+      const out = [];
+      const kwBox = this._$(".Keywords, .keywords-section");
+      if (!kwBox) return out;
+      // Common structures: div.keyword > span, or list of anchors/spans
+      const spans = this._all('.keyword span, .keyword, span.keyword, a.keyword', kwBox);
+      for (const s of spans) {
+        const t = this._mergeSoftWraps(this._text(s)).trim();
+        if (t) out.push(t);
+      }
+      // de-duplicate
+      return Array.from(new Set(out));
     }
 
     /**
@@ -1079,8 +1252,71 @@
       if (ann && ann.textContent) return String(ann.textContent).trim();
       const alt = mathEl.getAttribute("alttext");
       if (alt) return String(alt).trim();
-      // 兜底：无 TeX 则返回空
-      return "";
+      // 兜底：尝试从 MathML 结构粗略转换为 TeX（适配非 OA 的 MathJax Assistive MathML）
+      try {
+        const toTex = (node) => {
+          if (!node) return "";
+          const tag = (node.tagName || "").toLowerCase();
+          const text = (s) => (s || "").replace(/\s+/g, " ").trim();
+          const kids = Array.from(node.childNodes || []);
+          const joinKids = () => kids.map((c) => (c.nodeType === 1 ? toTex(c) : text(c.nodeValue))).join("");
+
+          switch (tag) {
+            case "math":
+            case "mrow":
+              return kids.map((c) => (c.nodeType === 1 ? toTex(c) : text(c.nodeValue))).join("");
+            case "mi":
+            case "mn":
+            case "mtext":
+              return text(node.textContent);
+            case "mo": {
+              const v = text(node.textContent);
+              if (v === "×") return "\\times";
+              if (v === "−" || v === "–") return "-";
+              if (v === "·") return "\\cdot";
+              if (v === "∞") return "\\infty";
+              if (v === "≤") return "\\le";
+              if (v === "≥") return "\\ge";
+              return v;
+            }
+            case "msup": {
+              const base = toTex(node.firstElementChild);
+              const sup = toTex(node.lastElementChild);
+              return `{${base}}^{${sup}}`;
+            }
+            case "msub": {
+              const base = toTex(node.firstElementChild);
+              const sub = toTex(node.lastElementChild);
+              return `{${base}}_{${sub}}`;
+            }
+            case "msubsup": {
+              const [base, sub, sup] = kids.filter((k) => k.nodeType === 1).map((el) => toTex(el));
+              return `{${base}}_{${sub}}^{${sup}}`;
+            }
+            case "mfrac": {
+              const [num, den] = kids.filter((k) => k.nodeType === 1).map((el) => toTex(el));
+              return `\\frac{${num}}{${den}}`;
+            }
+            case "msqrt": {
+              const inner = joinKids();
+              return `\\sqrt{${inner}}`;
+            }
+            case "mfenced": {
+              const open = node.getAttribute("open") || "(";
+              const close = node.getAttribute("close") || ")";
+              const inner = joinKids();
+              return `${open}${inner}${close}`;
+            }
+            case "mspace":
+              return " ";
+            default:
+              return text(node.textContent);
+          }
+        };
+        return toTex(mathEl) || "";
+      } catch {
+        return "";
+      }
     }
   }
 
@@ -1128,6 +1364,20 @@
       if (meta.abstract) {
         head.push("## Abstract");
         head.push(this._mergeSoftWraps(meta.abstract));
+        head.push("");
+      }
+
+      // Highlights (if any)
+      if (Array.isArray(meta.highlights) && meta.highlights.length) {
+        head.push("## Highlights");
+        for (const h of meta.highlights) head.push(`- ${this._mergeSoftWraps(h)}`);
+        head.push("");
+      }
+
+      // Keywords (if any)
+      if (Array.isArray(meta.keywords) && meta.keywords.length) {
+        head.push("## Keywords");
+        head.push(meta.keywords.join(", "));
         head.push("");
       }
 
@@ -2210,6 +2460,81 @@
       };
     }
 
+    /**
+     * 等待文章主体与引用内容加载完成（适配非 Open Access 页面异步加载）
+     * - 条件：存在至少一个 section[id^="sec"]，并且出现段落 div[id^='p'] 或参考文献条目/引文锚
+     * - 超时：默认 20s（仍继续执行，以当下已加载内容为准）
+     */
+    async _waitForArticleContent(maxWaitMs = 20000) {
+      const checkReady = () => {
+        const hasSec = !!document.querySelector("section[id^='sec'], section[id^='s']");
+        const hasPara = !!document.querySelector("section[id^='sec'] div[id^='p'], section[id^='s'] div[id^='p']");
+        const hasBib = !!document.querySelector(
+          "section.bibliography ol.references li, #references li"
+        );
+        const hasCiteAnchors = !!document.querySelector("a[href*='#bib'], a[href^='#b'], a[data-xocs-content-type='reference']");
+        // If authors have superscripts, wait for affiliations to load
+        const wantsAff = !!document.querySelector('.AuthorGroups .author-ref sup, .author-group .author-ref sup, #author-group .author-ref sup');
+        const hasAff = !!document.querySelector('dl.affiliation dt sup, dl.affiliation dt');
+        const authorAffReady = wantsAff ? hasAff : true;
+        return hasSec && (hasPara || hasBib || hasCiteAnchors) && authorAffReady;
+      };
+
+      if (checkReady()) return true;
+
+      return await new Promise((resolve) => {
+        let done = false;
+        let triedExpand = false;
+        const finish = (ok) => {
+          if (done) return;
+          done = true;
+          try { observer.disconnect(); } catch {}
+          clearTimeout(timer);
+          resolve(!!ok);
+        };
+
+        const observer = new MutationObserver(() => {
+          tryExpand();
+          if (checkReady()) finish(true);
+        });
+        try {
+          observer.observe(document.documentElement || document.body, {
+            childList: true,
+            subtree: true,
+          });
+        } catch {}
+
+        const timer = setTimeout(() => finish(false), Math.max(1000, maxWaitMs));
+
+        // 保险：页面 load 后再检查一次
+        if (document.readyState === 'complete') {
+          setTimeout(() => { tryExpand(); if (checkReady()) finish(true); }, 0);
+        } else {
+          window.addEventListener('load', () => {
+            setTimeout(() => { tryExpand(); if (checkReady()) finish(true); }, 0);
+          }, { once: true });
+        }
+
+        function tryExpand() {
+          if (triedExpand) return;
+          const hasAff = !!document.querySelector('dl.affiliation dt sup, dl.affiliation dt');
+          const wantsAff = !!document.querySelector('.AuthorGroups .author-ref sup, .author-group .author-ref sup, #author-group .author-ref sup');
+          if (hasAff || !wantsAff) return;
+          // Try clicking Show more to expand author affiliations
+          let btn = document.querySelector('#show-more-btn');
+          if (!btn) {
+            btn = Array.from(document.querySelectorAll('.Banner button, #banner button, .wrapper button'))
+              .find((b) => /show\s*more/i.test(b.textContent || '')) ||
+              document.querySelector("button.button-link[data-aa-button='icon-expand']");
+          }
+          if (btn) {
+            triedExpand = true;
+            try { btn.click(); } catch {}
+          }
+        }
+      });
+    }
+
     _prepareRun(mode, clearCache = true) {
       Log.info("Preparing run for mode:", mode, "clearCache:", clearCache);
 
@@ -2254,6 +2579,10 @@
      */
     async _buildBaseCacheWithOriginalLogic() {
       Log.info("Building base cache data with original logic...");
+
+      // 等待文章主体完成异步加载（非 OA 页面常见）
+      const ok = await this._waitForArticleContent(20000);
+      Log.info("Article content ready:", ok);
 
       // 提取基础数据
       const meta = this.adapter.getMeta();
@@ -2599,7 +2928,7 @@
      * @param {'links'|'base64'|'textbundle'} mode
      */
     async runPipeline(mode = "links") {
-      this._prepareRun(mode, false); // false表示不清除缓存
+      this._prepareRun(mode, true); // 改为每次运行清除缓存，确保解析最新 DOM（作者/机构等）
       Log.info("Pipeline start:", mode);
 
       // 检查缓存有效性
@@ -2660,7 +2989,13 @@
     _isParagraph(n) {
       return (
         n.matches &&
-        (n.matches("div.ltx_para > p.ltx_p") || n.matches("p.ltx_p"))
+        (
+          // ScienceDirect paragraphs collected in walkSections()
+          n.matches("div[id^='p']") ||
+          // Legacy LaTeXML paragraphs (arxiv-like)
+          n.matches("div.ltx_para > p.ltx_p") ||
+          n.matches("p.ltx_p")
+        )
       );
     }
     _isDisplayMath(n) {
@@ -2697,13 +3032,43 @@
     _renderParagraphWithMathAndCites(pNode, citeMap) {
       const clone = pNode.cloneNode(true);
 
-      // 行内 <math> → $...$
-      for (const m of Array.from(clone.querySelectorAll("math"))) {
-        const isDisplay =
-          (m.getAttribute("display") || "").toLowerCase() === "block";
-        if (isDisplay) continue;
-        const tex = this.adapter.extractMath(m)?.tex || "";
-        m.replaceWith(document.createTextNode(tex ? `$${tex}$` : ""));
+        // 行内 <math> → $...$
+        for (const m of Array.from(clone.querySelectorAll("math"))) {
+          const isDisplay =
+            (m.getAttribute("display") || "").toLowerCase() === "block";
+          if (isDisplay) continue;
+          const tex = this.adapter.extractMath(m)?.tex || "";
+          m.replaceWith(document.createTextNode(tex ? `$${tex}$` : ""));
+        }
+
+        // 处理 MathJax 渲染（非 OA）：将 SVG/Assistive MathML 转为 $...$ / $$...$$
+        for (const svg of Array.from(clone.querySelectorAll('span.MathJax_SVG'))) {
+          let tex = "";
+          const mml = svg.getAttribute('data-mathml');
+          if (mml) {
+            try {
+              const doc = new DOMParser().parseFromString(mml, 'application/xml');
+              const mathEl = doc.querySelector('math');
+              if (mathEl) tex = this.adapter._extractTeX(mathEl) || "";
+            } catch {}
+          }
+          if (!tex) {
+            const assist = svg.parentElement?.querySelector('span.MJX_Assistive_MathML math');
+            if (assist) tex = this.adapter._extractTeX(assist) || "";
+          }
+          if (tex) {
+            const isDisplay = !!(svg.closest('.display') || svg.closest('span.display'));
+            const node = document.createTextNode(isDisplay ? `$$${tex}$$` : `$${tex}$`);
+            svg.replaceWith(node);
+          }
+        }
+      // 清理 MathJax 注入的辅助节点，避免脚本内 MathML 文本泄漏到最终文本
+      for (const junk of Array.from(
+        clone.querySelectorAll(
+          'script[type="math/mml"], span.MathJax_SVG, span.MJX_Assistive_MathML, span.MathJax_Preview'
+        )
+      )) {
+        junk.remove();
       }
 
       // 文中引文 → [^R{n}] - 智能处理引用组
@@ -2804,14 +3169,23 @@
      * @param {Map} citeMap - 引用映射
      */
     _processCitations(container, citeMap) {
-      const citations = Array.from(container.querySelectorAll('a[href*="#bib"]'));
+      // 支持多模板的引文锚：#bibN（OA）、#b0005（非OA）、以及 reference 型锚
+      const citations = Array.from(
+        container.querySelectorAll('a[href*="#bib"], a[href^="#b"], a[data-xocs-content-type="reference"]')
+      );
       if (citations.length === 0) return;
 
       // 按文档顺序处理每个引用
       citations.forEach(citation => {
         const href = citation.getAttribute("href") || "";
         const key = this._normalizeBibHref(href);
-        const n = citeMap.get(key) ?? this._parseBibNumber(href);
+        let n = citeMap.get(key) ?? this._parseBibNumber(href);
+        if (n == null) {
+          // 兜底：从锚文本中提取编号，如 "[19]" / "19"
+          const t = (citation.textContent || "").trim();
+          const m = t.match(/\[(\d{1,4})\]/) || t.match(/\b(\d{1,4})\b/);
+          if (m) n = parseInt(m[1] || m[0], 10);
+        }
         
         if (n != null) {
           this._cited.add(n);
@@ -3193,7 +3567,7 @@
     },
 
     async _genMarkdownForPreview(controller, mode) {
-      controller._prepareRun(mode, false); // ← 预览时不清除缓存
+      controller._prepareRun(mode, true); // 预览时也清除缓存，避免旧解析结果
       const md = await controller.runPipeline(mode);
       if (mode === "base64")
         return await controller.exporter.asMarkdownBase64(
