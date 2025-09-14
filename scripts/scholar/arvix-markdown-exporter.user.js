@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Arvix Paper to Markdown Exporter (Enhanced)
 // @namespace    http://tampermonkey.net/
-// @version      0.0.1
+// @version      1.0.1
 // @description  Export Arvix papers to Markdown with complete metadata, TextBundle and Base64 formats
 // @author       Qi Deng <dengqi935@gmail.com>
 // @match        https://arxiv.org/html/*
@@ -51,6 +51,12 @@
       normalizeDelimiters: true,    // 规范 $...$ 与 $$...$$
       decodeEntitiesInsideMath: true,
     },
+    // —— 表格处理策略 ——
+    TABLES: {
+      mode: 'html',              // 'html' | 'markdown' | 'auto'
+      cleanOutput: true,         // 清理无用的CSS类和样式
+      preserveStructure: true    // 保持表格的完整结构
+    },
     // —— 打包策略（先占位，后续你可接 JSZip/fflate 等）——
     PACK: {
       provider: 'native',           // 'native' | 'jszip' | 'fflate'（骨架阶段仅占位）
@@ -61,9 +67,53 @@
   // 1) Logger (轻量)
   // -----------------------------
   const Log = {
-    info: (...a) => console.log(`[${Config.APP_NAME}]`, ...a),
-    warn: (...a) => console.warn(`[${Config.APP_NAME}]`, ...a),
-    error: (...a) => console.error(`[${Config.APP_NAME}]`, ...a),
+    entries: [],
+    info: (...a) => {
+      console.log(`[${Config.APP_NAME}]`, ...a);
+      Log._addEntry('info', ...a);
+    },
+    warn: (...a) => {
+      console.warn(`[${Config.APP_NAME}]`, ...a);
+      Log._addEntry('warn', ...a);
+    },
+    error: (...a) => {
+      console.error(`[${Config.APP_NAME}]`, ...a);
+      Log._addEntry('error', ...a);
+    },
+    _addEntry: (level, ...args) => {
+      const timestamp = new Date().toISOString();
+      const message = args.map(arg => 
+        typeof arg === 'object' ? JSON.stringify(arg, null, 2) : String(arg)
+      ).join(' ');
+      Log.entries.push({ timestamp, level, message });
+      Log._updateUI();
+    },
+    _updateUI: () => {
+      const logPanel = document.querySelector('[data-role="debug-log"]');
+      if (logPanel && !logPanel.classList.contains('arxiv-md-hide')) {
+        const content = logPanel.querySelector('.arxiv-md-log__content');
+        if (content) {
+          content.textContent = Log.entries.map(entry => 
+            `[${entry.timestamp.substring(11, 19)}] ${entry.level.toUpperCase()}: ${entry.message}`
+          ).join('\n');
+          content.scrollTop = content.scrollHeight;
+        }
+      }
+    },
+    clear: () => {
+      Log.entries = [];
+      Log._updateUI();
+    },
+    copy: () => {
+      const logText = Log.entries.map(entry => 
+        `[${entry.timestamp}] ${entry.level.toUpperCase()}: ${entry.message}`
+      ).join('\n');
+      navigator.clipboard.writeText(logText).then(() => {
+        console.log('Debug log copied to clipboard');
+      }).catch(err => {
+        console.error('Failed to copy log:', err);
+      });
+    }
   };
 
   // -----------------------------
@@ -384,38 +434,85 @@
      */
     extractTable(tbl) {
       if (!tbl) return { html: '' };
-      const rows = Array.from(tbl.querySelectorAll('tr'));
-      const colCount = rows.reduce((m, r) => Math.max(m, r.children.length), 0);
-      const tooWide = colCount > 12;
-
-      if (tooWide) {
-        return { html: tbl.outerHTML };
+      
+      // 根据配置决定输出格式
+      if (Config.TABLES.mode === 'html' || Config.TABLES.mode === 'auto') {
+        const html = Config.TABLES.cleanOutput ? 
+          this._cleanTableHtml(tbl) : 
+          tbl.outerHTML;
+        return { html };
       }
-
-      const headers = [];
-      const body = [];
-
-      // 头部（有 thead 用 thead；否则首行若含 th 也视为表头）
-      const thead = tbl.querySelector('thead');
-      if (thead) {
-        for (const tr of thead.querySelectorAll('tr')) {
-          headers.push(this._cellsToText(tr.querySelectorAll('th, td')));
+      
+      // 仅在用户明确要求时才生成Markdown表格
+      if (Config.TABLES.mode === 'markdown') {
+        const rows = Array.from(tbl.querySelectorAll('tr'));
+        const colCount = rows.reduce((m, r) => Math.max(m, r.children.length), 0);
+        
+        // 如果表格太复杂，仍然降级为HTML
+        if (colCount > 12) {
+          return { html: tbl.outerHTML };
         }
-      } else {
-        const first = rows[0];
-        if (first && first.querySelector('th')) {
-          headers.push(this._cellsToText(first.querySelectorAll('th, td')));
+        
+        // 原有的Markdown生成逻辑
+        const headers = [];
+        const body = [];
+        
+        const thead = tbl.querySelector('thead');
+        if (thead) {
+          for (const tr of thead.querySelectorAll('tr')) {
+            headers.push(this._cellsToText(tr.querySelectorAll('th, td')));
+          }
+        } else {
+          const first = rows[0];
+          if (first && first.querySelector('th')) {
+            headers.push(this._cellsToText(first.querySelectorAll('th, td')));
+          }
         }
+        
+        const bodyRows = thead ? tbl.querySelectorAll('tbody tr') :
+          (headers.length ? rows.slice(1) : rows);
+        for (const tr of bodyRows) {
+          body.push(this._cellsToText(tr.querySelectorAll('td, th')));
+        }
+        
+        return { headers, rows: body };
       }
+      
+      // 默认返回HTML
+      return { html: tbl.outerHTML };
+    }
 
-      // 主体
-      const bodyRows = thead ? tbl.querySelectorAll('tbody tr') :
-        (headers.length ? rows.slice(1) : rows);
-      for (const tr of bodyRows) {
-        body.push(this._cellsToText(tr.querySelectorAll('td, th')));
-      }
-
-      return { headers, rows: body };
+    /**
+     * 清理表格HTML，移除LaTeX特定的类名和样式
+     * @param {Element} table
+     * @returns {string}
+     */
+    _cleanTableHtml(table) {
+      const clone = table.cloneNode(true);
+      
+      // 移除LaTeX特定的类名，保留基本结构类
+      const elements = clone.querySelectorAll('*');
+      elements.forEach(el => {
+        if (el.className) {
+          const keepClasses = el.className.split(' ').filter(cls => 
+            /^(table|thead|tbody|tfoot|tr|th|td|text-center|text-left|text-right)$/.test(cls)
+          );
+          el.className = keepClasses.join(' ');
+        }
+        
+        // 移除内联样式，保留重要的对齐属性
+        if (el.style) {
+          const textAlign = el.style.textAlign;
+          const verticalAlign = el.style.verticalAlign;
+          
+          el.removeAttribute('style');
+          
+          if (textAlign) el.style.textAlign = textAlign;
+          if (verticalAlign) el.style.verticalAlign = verticalAlign;
+        }
+      });
+      
+      return clone.outerHTML;
     }
 
     /**
@@ -898,6 +995,15 @@
         this.buffers.footnotes.join('\n'),
         this.buffers.references.join('\n'),
       ].join('\n');
+    }
+
+    reset() {
+      this.buffers = {
+        head: [],
+        body: [],
+        footnotes: [],
+        references: []
+      };
     }
 
     // =============== 私有工具 ===============
@@ -1597,27 +1703,95 @@
       this.exporter = new Exporter();
       // 让 Exporter 能直接拿到资源列表
       this.exporter.bindAssets(this.assets);
+      
+      // 缓存系统
+      this._cache = {
+        meta: null,
+        bibliography: null,
+        citationMap: null,
+        sections: null,
+        baseMarkdown: null,    // 基础Markdown内容（links模式）
+        lastPageHash: null,    // 页面内容哈希
+        assetsSnapshot: null   // 资源快照
+      };
+    }
+
+    _prepareRun(mode, clearCache = true) {
+      Log.info('Preparing run for mode:', mode, 'clearCache:', clearCache);
+      
+      // 1) 清空文本缓冲
+      if (typeof this.emitter?.reset === 'function') {
+        this.emitter.reset();
+      } else {
+        this.emitter = new MarkdownEmitter(); // 兼容：万一没有 reset()
+      }
+      
+      // 2) 清空资源（即使 links 模式也清空，避免历史资产影响后续替换）
+      if (this.assets && typeof this.assets.clear === 'function') {
+        this.assets.clear();
+      }
+      
+      // 3) 清空本次运行的状态寄存
+      this._cited = new Set();
+      this._lastMeta = null;
+      
+      // 4) 可选择性清除缓存（页面刷新或强制重新生成时）
+      if (clearCache) {
+        this._invalidateCache();
+      }
+    }
+
+    // -----------------------------
+    // 缓存辅助方法
+    // -----------------------------
+    
+    /**
+     * 生成页面哈希用于缓存失效检测
+     */
+    _getPageHash() {
+      const title = document.title || '';
+      const bodyLength = document.body ? document.body.textContent.length : 0;
+      const abstractLength = U.$('div.ltx_abstract')?.textContent?.length || 0;
+      return `${title}-${bodyLength}-${abstractLength}`;
     }
 
     /**
-     * 端到端生成 Markdown
-     * @param {'links'|'base64'|'textbundle'} mode
+     * 构建基础缓存数据（使用原始完整逻辑，固定为links模式）
      */
-    async runPipeline(mode = 'links') {
-      Log.info('Pipeline start:', mode);
-
+    async _buildBaseCacheWithOriginalLogic() {
+      Log.info('Building base cache data with original logic...');
+      
+      // 提取基础数据
       const meta = this.adapter.getMeta();
+      Log.info('Cached metadata:', { title: meta.title, authors: meta.authors.length });
       this._lastMeta = meta;
+      
       const bib = this.adapter.collectBibliography();
+      Log.info('Cached bibliography:', bib.length, 'references');
+      
       const citeMap = this.adapter.buildCitationMap(bib);
       const sections = this.adapter.walkSections();
+      Log.info('Cached sections:', sections.length);
 
-      // 已引用参考号（用于生成 R* 脚注）
+      // 缓存基础数据
+      this._cache.meta = meta;
+      this._cache.bibliography = bib;
+      this._cache.citationMap = citeMap;
+      this._cache.sections = sections;
+
+      // 生成基础Markdown（使用links模式的完整原始逻辑）
+      this._cache.baseMarkdown = await this._generateBaseCacheMarkdown(meta, bib, citeMap, sections);
+      
+      Log.info('Base cache built successfully');
+    }
+
+    /**
+     * 生成基础缓存Markdown（完整原始逻辑，固定links模式）
+     */
+    async _generateBaseCacheMarkdown(meta, bib, citeMap, sections) {
+      // 重置状态
       this._cited = new Set();
-      // 正文脚注（F*）
       const footF = [];
-
-      // 清空段落去重缓存
       this._paraSeen = undefined;
       this._paraQueue = undefined;
 
@@ -1625,7 +1799,7 @@
       this.emitter.emitFrontMatter(meta);
       this.emitter.emitTOCPlaceholder();
 
-      // 正文
+      // 正文 - 使用原始完整逻辑但固定links模式
       for (const sec of sections) {
         this.emitter.emitHeading(sec.level || 2, sec.title || 'Section', sec.anchor);
 
@@ -1645,7 +1819,126 @@
             continue;
           }
 
-          // 图（位图优先；textbundle 落地 SVG 文件，其它模式内联）
+          // 图（固定使用links模式逻辑）
+          if (node.matches && node.matches('figure.ltx_figure')) {
+            const fig = this.adapter.extractFigure(node);
+            if (!fig) continue;
+
+            if (fig.kind === 'img') {
+              // 固定使用links模式
+              this.emitter.emitFigure({ kind: 'img', path: fig.src, caption: fig.caption });
+            } else if (fig.kind === 'svg') {
+              // 固定使用内联SVG模式（非textbundle）
+              this.emitter.emitFigure({ kind: 'svg', inlineSvg: fig.inlineSvg, caption: fig.caption });
+            }
+            continue;
+          }
+
+          // 表
+          if (node.matches && node.matches('table.ltx_tabular')) {
+            const t = this.adapter.extractTable(node);
+            this.emitter.emitTable(t);
+            continue;
+          }
+
+          // 列表（转行内数学与引文，再近邻去重逐行落）
+          if (node.matches && node.matches('ul, ol')) {
+            const lines = this._renderList(node, citeMap, 0);
+            for (const l of lines) this._emitParagraphDedup(l);
+            continue;
+          }
+
+          // 代码块
+          if (node.matches && node.matches('pre.ltx_verbatim, .ltx_listing pre')) {
+            const code = (node.textContent || '').replace(/\s+$/, '');
+            this.emitter.emitParagraph('```\n' + code + '\n```');
+            continue;
+          }
+
+          // 正文脚注
+          if (node.matches && node.matches('div.ltx_note.ltx_role_footnote')) {
+            const f = this.adapter.extractFootnote(node);
+            if (f) footF.push(f);
+            continue;
+          }
+
+          // 兜底：当作段落处理并去重
+          const fallback = (node.textContent || '').trim();
+          if (fallback) this._emitParagraphDedup(fallback);
+        }
+      }
+
+      // 生成参考脚注（R*，直接写全参考条目文本+DOI/URL）
+      const footR = this._makeReferenceFootnotes(bib, this._cited);
+
+      // 合并 F*/R* 脚注并按 key 去重
+      const footMap = new Map();
+      for (const f of [...(footF || []), ...(footR || [])]) {
+        if (f?.key && f?.content && !footMap.has(f.key)) footMap.set(f.key, f.content);
+      }
+      this.emitter.emitFootnotes([...footMap].map(([key, content]) => ({ key, content })));
+
+      // 文末参考
+      this.emitter.emitReferences(bib);
+
+      // 生成最终Markdown
+      return this.emitter.compose();
+    }
+
+    /**
+     * 根据模式处理差异（使用原始逻辑）
+     */
+    async _processForModeWithOriginalLogic(mode) {
+      if (mode === 'links') {
+        Log.info('Using cached links mode markdown...');
+        return this._cache.baseMarkdown;
+      } else {
+        Log.info('Processing mode-specific logic for:', mode);
+        // 对于非links模式，需要重新运行图片处理逻辑
+        return await this._regenerateWithModeSpecificLogic(mode);
+      }
+    }
+
+    /**
+     * 使用缓存数据重新生成特定模式的Markdown
+     */
+    async _regenerateWithModeSpecificLogic(mode) {
+      const { meta, bib, citeMap, sections } = this._cache;
+      
+      // 重置状态
+      this._cited = new Set();
+      const footF = [];
+      this._paraSeen = undefined;
+      this._paraQueue = undefined;
+
+      // 重置emitter（为了避免与缓存构建时的冲突）
+      this.emitter.reset();
+
+      // 头部
+      this.emitter.emitFrontMatter(meta);
+      this.emitter.emitTOCPlaceholder();
+
+      // 正文 - 使用原始逻辑但根据模式处理图片
+      for (const sec of sections) {
+        this.emitter.emitHeading(sec.level || 2, sec.title || 'Section', sec.anchor);
+
+        for (const node of (sec.nodes || [])) {
+          // 段落（含行内数学/引文替换 + 清噪 + 近邻去重）
+          if (this._isParagraph(node)) {
+            const text = this._renderParagraphWithMathAndCites(node, citeMap);
+            this._emitParagraphDedup(text);
+            continue;
+          }
+
+          // 块级数学
+          if (this._isDisplayMath(node) ||
+            (node.tagName?.toLowerCase() === 'math' && (node.getAttribute('display') || '').toLowerCase() === 'block')) {
+            const m = this.adapter.extractMath(node);
+            if (m) this.emitter.emitMath(m);
+            continue;
+          }
+
+          // 图（根据模式使用不同逻辑 - 原始完整逻辑）
           if (node.matches && node.matches('figure.ltx_figure')) {
             const fig = this.adapter.extractFigure(node);
             if (!fig) continue;
@@ -1723,9 +2016,52 @@
       // 文末参考
       this.emitter.emitReferences(bib);
 
-      // 收口
-      const markdown = this.emitter.compose();
-      return markdown;
+      // 生成最终Markdown
+      return this.emitter.compose();
+    }
+
+    /**
+     * 清除缓存
+     */
+    _invalidateCache() {
+      this._cache = {
+        meta: null,
+        bibliography: null,
+        citationMap: null,
+        sections: null,
+        baseMarkdown: null,
+        lastPageHash: null,
+        assetsSnapshot: null
+      };
+      Log.info('Cache invalidated');
+    }
+
+    /**
+     * 端到端生成 Markdown
+     * @param {'links'|'base64'|'textbundle'} mode
+     */
+    async runPipeline(mode = 'links') {
+      this._prepareRun(mode, false); // false表示不清除缓存
+      Log.info('Pipeline start:', mode);
+
+      // 检查缓存有效性
+      const currentPageHash = this._getPageHash();
+      const cacheValid = this._cache.lastPageHash === currentPageHash && this._cache.baseMarkdown;
+
+      if (!cacheValid) {
+        Log.info('Cache invalid or missing, rebuilding base cache...');
+        await this._buildBaseCacheWithOriginalLogic();
+        this._cache.lastPageHash = currentPageHash;
+      } else {
+        Log.info('Using cached data for faster processing...');
+        // 恢复缓存的状态
+        this._lastMeta = this._cache.meta;
+      }
+
+      // 根据模式处理差异
+      const result = await this._processForModeWithOriginalLogic(mode);
+      Log.info('Pipeline completed. Generated markdown:', result.length, 'characters');
+      return result;
     }
 
     // —— 导出 —— //
@@ -1960,6 +2296,21 @@
       .arxiv-md-btn--ghost:hover{color:var(--ax-text)}
       .arxiv-md-hide{display:none!important}
 
+      /* Debug Log Panel */
+      .arxiv-md-log{margin-top:8px;border:1px solid var(--ax-border);border-radius:8px;background:rgba(0,0,0,.02)}
+      .arxiv-md-log__header{display:flex;justify-content:space-between;align-items:center;padding:6px 8px;border-bottom:1px solid var(--ax-border);background:rgba(0,0,0,.03)}
+      .arxiv-md-log__title{font-size:11px;font-weight:700;color:var(--ax-muted)}
+      .arxiv-md-log__actions{display:flex;gap:4px}
+      .arxiv-md-log__btn{padding:2px 6px;font-size:10px;border:0;border-radius:4px;cursor:pointer;background:transparent;color:var(--ax-muted);font-weight:500}
+      .arxiv-md-log__btn:hover{color:var(--ax-text);background:rgba(0,0,0,.05)}
+      .arxiv-md-log__content{height:120px;overflow-y:auto;padding:6px 8px;font-family:ui-monospace,SFMono-Regular,Monaco,Consolas,"Liberation Mono","Courier New",monospace;font-size:10px;line-height:1.3;white-space:pre-wrap;word-break:break-word;color:var(--ax-text);background:#fff0}
+      @media (prefers-color-scheme: dark){.arxiv-md-log{background:rgba(255,255,255,.02)}.arxiv-md-log__header{background:rgba(255,255,255,.03)}.arxiv-md-log__content{background:rgba(0,0,0,.1)}}
+
+      /* Footer */
+      .arxiv-md-footer{margin-top:8px;padding-top:6px;border-top:1px solid var(--ax-border);text-align:center;font-size:10px;color:var(--ax-muted)}
+      .arxiv-md-footer a{color:var(--ax-accent);text-decoration:none}
+      .arxiv-md-footer a:hover{text-decoration:underline}
+
       /* 预览层（懒加载后才注入 DOM） */
       .arxiv-md-overlay{position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:${Z + 1};display:none}
       .arxiv-md-modal{position:fixed;inset:5% 8%;background:var(--ax-bg);color:var(--ax-text);border:1px solid var(--ax-border);border-radius:12px;box-shadow:var(--ax-shadow);display:none;z-index:${Z + 2};overflow:hidden;display:flex;flex-direction:column}
@@ -1990,6 +2341,20 @@
         <button class="arxiv-md-btn" data-action="links">导出 · 链接</button>
         <button class="arxiv-md-btn" data-action="base64">导出 · Base64</button>
         <button class="arxiv-md-btn arxiv-md-btn--secondary" data-action="textbundle">导出 · TextBundle</button>
+        <button class="arxiv-md-btn arxiv-md-btn--ghost" data-action="debug-log">调试日志</button>
+      </div>
+      <div class="arxiv-md-log arxiv-md-hide" data-role="debug-log">
+        <div class="arxiv-md-log__header">
+          <span class="arxiv-md-log__title">调试日志</span>
+          <div class="arxiv-md-log__actions">
+            <button class="arxiv-md-log__btn" data-action="clear-log">清空</button>
+            <button class="arxiv-md-log__btn" data-action="copy-log">复制</button>
+          </div>
+        </div>
+        <div class="arxiv-md-log__content"></div>
+      </div>
+      <div class="arxiv-md-footer">
+        © Qi Deng - <a href="https://github.com/nerdneilsfield/neils-monkey-scripts/" target="_blank">GitHub</a>
       </div>
     `;
       document.body.appendChild(panel);
@@ -2014,6 +2379,19 @@
             const md = await UI._genMarkdownForPreview(controller, mode);
             const { overlay, modal } = UI._ensurePreview();   // ★ 懒加载
             UI._openPreview(modal, overlay, md, mode, controller);
+          }
+          if (act === 'debug-log') {
+            const logPanel = panel.querySelector('[data-role="debug-log"]');
+            logPanel.classList.toggle('arxiv-md-hide');
+            if (!logPanel.classList.contains('arxiv-md-hide')) {
+              Log._updateUI(); // Update content when showing
+            }
+          }
+          if (act === 'clear-log') {
+            Log.clear();
+          }
+          if (act === 'copy-log') {
+            Log.copy();
           }
         } catch (err) {
           (typeof Log !== 'undefined' ? Log : console).error(err);
@@ -2117,6 +2495,7 @@
     },
 
     async _genMarkdownForPreview(controller, mode) {
+      controller._prepareRun(mode, false);  // ← 预览时不清除缓存
       const md = await controller.runPipeline(mode);
       if (mode === 'base64') return await controller.exporter.asMarkdownBase64(md, controller.assets.list());
       return md;
