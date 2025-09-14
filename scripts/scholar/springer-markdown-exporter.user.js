@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Springer Chapter to Markdown Exporter (Framework)
 // @namespace    http://tampermonkey.net/
-// @version      1.0.1
+// @version      1.0.2
 // @description  Export SpringerLink chapter pages to Markdown (Links/Base64/TextBundle) — Framework Only
 // @author       qiqi
 // @match        https://link.springer.com/chapter/*
@@ -61,9 +61,53 @@
     // 1) Logger
     // -----------------------------
     const Log = {
-        info: (...a) => console.log(`[${Config.APP_NAME}]`, ...a),
-        warn: (...a) => console.warn(`[${Config.APP_NAME}]`, ...a),
-        error: (...a) => console.error(`[${Config.APP_NAME}]`, ...a),
+        entries: [],
+        info: (...a) => {
+            console.log(`[${Config.APP_NAME}]`, ...a);
+            Log._addEntry('info', ...a);
+        },
+        warn: (...a) => {
+            console.warn(`[${Config.APP_NAME}]`, ...a);
+            Log._addEntry('warn', ...a);
+        },
+        error: (...a) => {
+            console.error(`[${Config.APP_NAME}]`, ...a);
+            Log._addEntry('error', ...a);
+        },
+        _addEntry: (level, ...args) => {
+            const timestamp = new Date().toISOString();
+            const message = args.map(arg => 
+                typeof arg === 'object' ? JSON.stringify(arg, null, 2) : String(arg)
+            ).join(' ');
+            Log.entries.push({ timestamp, level, message });
+            Log._updateUI();
+        },
+        _updateUI: () => {
+            const logPanel = document.querySelector('[data-role="debug-log"]');
+            if (logPanel && !logPanel.classList.contains('spring-md-hide')) {
+                const content = logPanel.querySelector('.spring-md-log__content');
+                if (content) {
+                    content.textContent = Log.entries.map(entry => 
+                        `[${entry.timestamp.substring(11, 19)}] ${entry.level.toUpperCase()}: ${entry.message}`
+                    ).join('\n');
+                    content.scrollTop = content.scrollHeight;
+                }
+            }
+        },
+        clear: () => {
+            Log.entries = [];
+            Log._updateUI();
+        },
+        copy: () => {
+            const logText = Log.entries.map(entry => 
+                `[${entry.timestamp}] ${entry.level.toUpperCase()}: ${entry.message}`
+            ).join('\n');
+            navigator.clipboard.writeText(logText).then(() => {
+                console.log('Debug log copied to clipboard');
+            }).catch(err => {
+                console.error('Failed to copy log:', err);
+            });
+        }
     };
 
     // -----------------------------
@@ -1530,20 +1574,68 @@
             this.emitter = new MarkdownEmitter();
             this.exporter = new Exporter();
             this.exporter.bindAssets(this.assets);
+            
+            // 缓存系统
+            this._cache = {
+                meta: null,
+                bibliography: null,
+                citationMap: null,
+                sections: null,
+                baseMarkdown: null,    // 基础Markdown内容（links模式）
+                lastPageHash: null,    // 页面内容哈希
+                assetsSnapshot: null   // 资源快照
+            };
         }
 
-        async runPipeline(mode = 'links') {
-            this._prepareRun(mode);   // ← 关键：每次运行先清空
-            Log.info('Pipeline start:', mode);
+        // -----------------------------
+        // 缓存辅助方法
+        // -----------------------------
+        
+        /**
+         * 生成页面哈希用于缓存失效检测
+         */
+        _getPageHash() {
+            const title = document.title || '';
+            const bodyLength = document.body ? document.body.textContent.length : 0;
+            const abstractLength = U.$('div[role="doc-abstract"], .c-article-section--abstract')?.textContent?.length || 0;
+            return `${title}-${bodyLength}-${abstractLength}`;
+        }
 
+        /**
+         * 构建基础缓存数据（使用原始完整逻辑，固定为links模式）
+         */
+        async _buildBaseCacheWithOriginalLogic() {
+            Log.info('Building base cache data with original logic...');
+            
+            // 提取基础数据
             const meta = this.adapter.getMeta();
+            Log.info('Cached metadata:', { title: meta.title, authors: meta.authors.length });
             this._lastMeta = meta;
-
-
+            
             const bib = await this.adapter.collectBibliography();
+            Log.info('Cached bibliography:', bib.length, 'references');
+            
             const citeMap = this.adapter.buildCitationMap(bib);
-
             const sections = this.adapter.walkSections();
+            Log.info('Cached sections:', sections.length);
+
+            // 缓存基础数据
+            this._cache.meta = meta;
+            this._cache.bibliography = bib;
+            this._cache.citationMap = citeMap;
+            this._cache.sections = sections;
+
+            // 生成基础Markdown（使用links模式的完整原始逻辑）
+            this._cache.baseMarkdown = await this._generateBaseCacheMarkdown(meta, bib, citeMap, sections);
+            
+            Log.info('Base cache built successfully');
+        }
+
+        /**
+         * 生成基础缓存Markdown（完整原始逻辑，固定links模式）
+         */
+        async _generateBaseCacheMarkdown(meta, bib, citeMap, sections) {
+            // 重置状态
             this._cited = new Set();
             const footF = [];
 
@@ -1557,93 +1649,209 @@
                     const tag = (node.tagName || '').toLowerCase();
 
                     // —— 段落（含行内TeX、脚注、行内格式保留、去掉UI图标）——
-                    if (tag === 'p') {
-                        const text = this._renderParagraphWithCites(node, citeMap);
-                        this.emitter.emitParagraph(text);
+                    if (this.adapter.isElementParagraph(node)) {
+                        const ptext = this.adapter.renderParagraphWithInlineMathAndCitations(node, citeMap, footF);
+                        this.emitter.emitParagraph(ptext);
                         continue;
                     }
 
-                    // —— 方程块（块级TeX）——
-                    if (tag === 'div' && node.classList.contains('c-article-equation')) {
-                        const em = this.adapter.extractEquationBlock(node);
-                        if (em) this.emitter.emitMath(em);
-                        continue;
-                    }
-                    if (tag === 'math') {
-                        const m = this.adapter.extractMath(node);
-                        if (m) this.emitter.emitMath(m);
+                    // —— 数学块——
+                    if (this.adapter.isDisplayMath(node)) {
+                        const mathStr = this.adapter.extractDisplayMath(node);
+                        this.emitter.emitMath(mathStr);
                         continue;
                     }
 
-                    // —— 表：优先识别（容器 + 表样式figure）——
-                    if (
-                        (node.matches && (this.adapter.isTableContainer(node) || this.adapter.isTableLikeFigure(node))) ||
-                        tag === 'table'
-                    ) {
-                        const t = await this.adapter.extractTable(node);
-                        this.emitter.emitTable(t);
+                    // —— 图片——
+                    if (this.adapter.isFigure(node)) {
+                        const fig = await this.adapter.extractFigure(node, 'links'); // 固定links模式
+                        this.emitter.emitFigure(fig);
                         continue;
                     }
 
-                    // —— 纯图片 figure（排除表样式figure）——
-                    if (tag === 'figure' && !(this.adapter.isTableLikeFigure(node))) {
-                        const fig = await this.adapter.extractFigure(node);
-                        if (!fig) { /* 若为空说明不是有效图，继续看其它分支 */ }
-                        else if (fig.kind === 'img') {
-                            if (mode === 'links') {
-                                this.emitter.emitFigure({ kind: 'img', path: fig.src || fig.path, caption: fig.caption });
-                            } else {
-                                const r = await this.assets.fetchRaster(fig.src || fig.path);
-                                this.emitter.emitFigure({ kind: 'img', path: r.assetPath || r.path, caption: fig.caption });
-                            }
-                            continue;
-                        } else if (fig.kind === 'svg') {
-                            // 过滤掉 UI 小图标（已在 adapter 侧尽量避免，这里再兜底）
-                            if (fig.inlineSvg && /class="u-icon"|xlink:href="#icon-eds-/i.test(fig.inlineSvg)) {
-                                // 丢弃
-                            } else if (mode === 'textbundle') {
-                                let svgEl = null;
-                                try {
-                                    if (fig.inlineSvg) svgEl = new DOMParser().parseFromString(fig.inlineSvg, 'image/svg+xml').documentElement;
-                                    else if (node.querySelector) svgEl = node.querySelector('svg');
-                                } catch { }
-                                const r = await this.assets.registerSvg(svgEl, (fig.id ? `${fig.id}.svg` : 'figure.svg'));
-                                this.emitter.emitFigure({ kind: 'svg', path: r.assetPath, caption: fig.caption });
-                            } else {
-                                this.emitter.emitFigure({ kind: 'svg', inlineSvg: fig.inlineSvg, caption: fig.caption });
-                            }
-                            continue;
+                    // —— 表格 ——
+                    if (this.adapter.isTable(node)) {
+                        const table = this.adapter.extractTable(node);
+                        this.emitter.emitTable(table);
+                        continue;
+                    }
+
+                    // —— 列表 ——
+                    if (this.adapter.isList(node)) {
+                        const listMd = this.adapter.renderListWithInlineMathAndCitations(node, citeMap, footF);
+                        this.emitter.emitParagraph(listMd);
+                        continue;
+                    }
+
+                    // —— 代码块——
+                    if (this.adapter.isCodeBlock(node)) {
+                        const code = this.adapter.extractCodeBlock(node);
+                        this.emitter.emitParagraph(code);
+                        continue;
+                    }
+
+                    // —— 脚注（收集但不直接渲染）——
+                    if (this.adapter.isFootnote(node)) {
+                        const foot = this.adapter.extractFootnote(node);
+                        if (foot) footF.push(foot);
+                        continue;
+                    }
+
+                    // —— 兜底——
+                    if (node.textContent && node.textContent.trim()) {
+                        const fallback = this.adapter.cleanTextContent(node.textContent);
+                        if (fallback.length > 5) {
+                            this.emitter.emitParagraph(fallback);
                         }
-                        // 若 fig == null（如被识别为表样式figure），不要中断，让后续分支继续
                     }
-
-                    // —— 列表 / 代码块 / 兜底 —— 
-                    if (tag === 'ul' || tag === 'ol') {
-                        for (const line of this._renderList(node, citeMap, 0)) this.emitter.emitParagraph(line);
-                        continue;
-                    }
-                    if (tag === 'pre') {
-                        const code = (node.textContent || '').replace(/\s+$/, '');
-                        this.emitter.emitParagraph('```\n' + code + '\n```');
-                        continue;
-                    }
-                    const fallback = (node.textContent || '').trim();
-                    if (fallback) this.emitter.emitParagraph(fallback);
                 }
             }
-
-            // 脚注区（全部参考）
-            const footR = this._makeReferenceFootnotes(bib);
-            const footMap = new Map();
-            for (const f of [...(footF || []), ...(footR || [])]) {
-                if (f?.key && f?.content && !footMap.has(f.key)) footMap.set(f.key, f.content);
-            }
-            this.emitter.emitFootnotes([...footMap].map(([key, content]) => ({ key, content })));
 
             // References（全部参考）
             this.emitter.emitReferences(bib);
 
             return this.emitter.compose();
+        }
+
+        /**
+         * 根据模式处理差异（使用原始逻辑）
+         */
+        async _processForModeWithOriginalLogic(mode) {
+            if (mode === 'links') {
+                Log.info('Using cached links mode markdown...');
+                return this._cache.baseMarkdown;
+            } else {
+                Log.info('Processing mode-specific logic for:', mode);
+                // 对于非links模式，需要重新运行图片处理逻辑
+                return await this._regenerateWithModeSpecificLogic(mode);
+            }
+        }
+
+        /**
+         * 使用缓存数据重新生成特定模式的Markdown
+         */
+        async _regenerateWithModeSpecificLogic(mode) {
+            const { meta, bib, citeMap, sections } = this._cache;
+            
+            // 重置状态
+            this._cited = new Set();
+            const footF = [];
+
+            // 重置emitter（为了避免与缓存构建时的冲突）
+            this.emitter.reset();
+
+            this.emitter.emitFrontMatter(meta);
+            this.emitter.emitTOCPlaceholder();
+
+            for (const sec of sections) {
+                this.emitter.emitHeading(sec.level || 2, sec.title || 'Section', sec.anchor);
+
+                for (const node of (sec.nodes || [])) {
+                    const tag = (node.tagName || '').toLowerCase();
+
+                    // —— 段落（含行内TeX、脚注、行内格式保留、去掉UI图标）——
+                    if (this.adapter.isElementParagraph(node)) {
+                        const ptext = this.adapter.renderParagraphWithInlineMathAndCitations(node, citeMap, footF);
+                        this.emitter.emitParagraph(ptext);
+                        continue;
+                    }
+
+                    // —— 数学块——
+                    if (this.adapter.isDisplayMath(node)) {
+                        const mathStr = this.adapter.extractDisplayMath(node);
+                        this.emitter.emitMath(mathStr);
+                        continue;
+                    }
+
+                    // —— 图片（根据模式使用不同逻辑）——
+                    if (this.adapter.isFigure(node)) {
+                        const fig = await this.adapter.extractFigure(node, mode); // 使用传入的模式
+                        this.emitter.emitFigure(fig);
+                        continue;
+                    }
+
+                    // —— 表格 ——
+                    if (this.adapter.isTable(node)) {
+                        const table = this.adapter.extractTable(node);
+                        this.emitter.emitTable(table);
+                        continue;
+                    }
+
+                    // —— 列表 ——
+                    if (this.adapter.isList(node)) {
+                        const listMd = this.adapter.renderListWithInlineMathAndCitations(node, citeMap, footF);
+                        this.emitter.emitParagraph(listMd);
+                        continue;
+                    }
+
+                    // —— 代码块——
+                    if (this.adapter.isCodeBlock(node)) {
+                        const code = this.adapter.extractCodeBlock(node);
+                        this.emitter.emitParagraph(code);
+                        continue;
+                    }
+
+                    // —— 脚注（收集但不直接渲染）——
+                    if (this.adapter.isFootnote(node)) {
+                        const foot = this.adapter.extractFootnote(node);
+                        if (foot) footF.push(foot);
+                        continue;
+                    }
+
+                    // —— 兜底——
+                    if (node.textContent && node.textContent.trim()) {
+                        const fallback = this.adapter.cleanTextContent(node.textContent);
+                        if (fallback.length > 5) {
+                            this.emitter.emitParagraph(fallback);
+                        }
+                    }
+                }
+            }
+
+            // References（全部参考）
+            this.emitter.emitReferences(bib);
+
+            return this.emitter.compose();
+        }
+
+        /**
+         * 清除缓存
+         */
+        _invalidateCache() {
+            this._cache = {
+                meta: null,
+                bibliography: null,
+                citationMap: null,
+                sections: null,
+                baseMarkdown: null,
+                lastPageHash: null,
+                assetsSnapshot: null
+            };
+            Log.info('Cache invalidated');
+        }
+
+        async runPipeline(mode = 'links') {
+            this._prepareRun(mode, false); // false表示不清除缓存
+            Log.info('Pipeline start:', mode);
+
+            // 检查缓存有效性
+            const currentPageHash = this._getPageHash();
+            const cacheValid = this._cache.lastPageHash === currentPageHash && this._cache.baseMarkdown;
+
+            if (!cacheValid) {
+                Log.info('Cache invalid or missing, rebuilding base cache...');
+                await this._buildBaseCacheWithOriginalLogic();
+                this._cache.lastPageHash = currentPageHash;
+            } else {
+                Log.info('Using cached data for faster processing...');
+                // 恢复缓存的状态
+                this._lastMeta = this._cache.meta;
+            }
+
+            // 根据模式处理差异
+            const result = await this._processForModeWithOriginalLogic(mode);
+            Log.info('Pipeline completed. Generated markdown:', result.length, 'characters');
+            return result;
         }
 
         // —— 导出 —— //
@@ -1675,7 +1883,9 @@
             }
         }
 
-        _prepareRun(mode) {
+        _prepareRun(mode, clearCache = true) {
+            Log.info('Preparing run for mode:', mode, 'clearCache:', clearCache);
+            
             // 1) 清空文本缓冲
             if (typeof this.emitter?.reset === 'function') {
                 this.emitter.reset();
@@ -1699,6 +1909,11 @@
 
             // 5) 标记本次运行模式（如需在调试中使用）
             this._runMode = mode || 'links';
+            
+            // 6) 可选择性清除缓存（页面刷新或强制重新生成时）
+            if (clearCache) {
+                this._invalidateCache();
+            }
         }
 
 
@@ -1888,6 +2103,22 @@
         .springer-md-btn--secondary:hover{background:rgba(0,0,0,.05)}
         .springer-md-btn--ghost{background:transparent;color:var(--ax-muted)} .springer-md-btn--ghost:hover{color:var(--ax-text)}
         .springer-md-hide{display:none!important}
+        
+        /* Debug Log Panel */
+        .springer-md-log{margin-top:8px;border:1px solid var(--ax-border);border-radius:8px;background:rgba(0,0,0,.02)}
+        .springer-md-log__header{display:flex;justify-content:space-between;align-items:center;padding:6px 8px;border-bottom:1px solid var(--ax-border);background:rgba(0,0,0,.03)}
+        .springer-md-log__title{font-size:11px;font-weight:700;color:var(--ax-muted)}
+        .springer-md-log__actions{display:flex;gap:4px}
+        .springer-md-log__btn{padding:2px 6px;font-size:10px;border:0;border-radius:4px;cursor:pointer;background:transparent;color:var(--ax-muted);font-weight:500}
+        .springer-md-log__btn:hover{color:var(--ax-text);background:rgba(0,0,0,.05)}
+        .springer-md-log__content{height:120px;overflow-y:auto;padding:6px 8px;font-family:ui-monospace,SFMono-Regular,Monaco,Consolas,"Liberation Mono","Courier New",monospace;font-size:10px;line-height:1.3;white-space:pre-wrap;word-break:break-word;color:var(--ax-text);background:#fff0}
+        @media (prefers-color-scheme: dark){.springer-md-log{background:rgba(255,255,255,.02)}.springer-md-log__header{background:rgba(255,255,255,.03)}.springer-md-log__content{background:rgba(0,0,0,.1)}}
+        
+        /* Footer */
+        .springer-md-footer{margin-top:8px;padding-top:6px;border-top:1px solid var(--ax-border);text-align:center;font-size:10px;color:var(--ax-muted)}
+        .springer-md-footer a{color:var(--ax-accent);text-decoration:none}
+        .springer-md-footer a:hover{text-decoration:underline}
+        
         .springer-md-overlay{position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:${Z + 1};display:none}
         .springer-md-modal{position:fixed;inset:5% 8%;background:var(--ax-bg);color:var(--ax-text);border:1px solid var(--ax-border);border-radius:12px;box-shadow:var(--ax-shadow);display:none;z-index:${Z + 2};overflow:hidden;display:flex;flex-direction:column}
         .springer-md-modal__bar{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid var(--ax-border)}
@@ -1916,6 +2147,20 @@
           <button class="springer-md-btn" data-action="links">导出 · 链接</button>
           <button class="springer-md-btn" data-action="base64">导出 · Base64</button>
           <button class="springer-md-btn springer-md-btn--secondary" data-action="textbundle">导出 · TextBundle</button>
+          <button class="springer-md-btn springer-md-btn--ghost" data-action="debug-log">调试日志</button>
+        </div>
+        <div class="springer-md-log springer-md-hide" data-role="debug-log">
+          <div class="springer-md-log__header">
+            <span class="springer-md-log__title">调试日志</span>
+            <div class="springer-md-log__actions">
+              <button class="springer-md-log__btn" data-action="clear-log">清空</button>
+              <button class="springer-md-log__btn" data-action="copy-log">复制</button>
+            </div>
+          </div>
+          <div class="springer-md-log__content"></div>
+        </div>
+        <div class="springer-md-footer">
+          © Qi Deng - <a href="https://github.com/nerdneilsfield/neils-monkey-scripts/" target="_blank">GitHub</a>
         </div>
         `;
             document.body.appendChild(panel);
@@ -1936,6 +2181,19 @@
                         const md = await UI._genMarkdownForPreview(controller, mode);
                         const { overlay, modal } = UI._ensurePreview();
                         UI._openPreview(modal, overlay, md, mode, controller);
+                    }
+                    if (act === 'debug-log') {
+                        const logPanel = panel.querySelector('[data-role="debug-log"]');
+                        logPanel.classList.toggle('springer-md-hide');
+                        if (!logPanel.classList.contains('springer-md-hide')) {
+                            Log._updateUI(); // Update content when showing
+                        }
+                    }
+                    if (act === 'clear-log') {
+                        Log.clear();
+                    }
+                    if (act === 'copy-log') {
+                        Log.copy();
                     }
                 } catch (err) {
                     Log.error(err);
@@ -2028,7 +2286,7 @@
         },
 
         async _genMarkdownForPreview(controller, mode) {
-            controller._prepareRun(mode);
+            controller._prepareRun(mode, false);  // ← 预览时不清除缓存
             const md = await controller.runPipeline(mode);
             if (mode === 'base64') return await controller.exporter.asMarkdownBase64(md, controller.assets.list());
             return md;
