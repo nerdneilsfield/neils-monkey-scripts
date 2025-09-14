@@ -290,7 +290,7 @@
 
     async fetchReferences() {
       try {
-        const referencesUrl = `${CONFIG.API_BASE}/${this.documentId}/references`;
+        const referencesUrl = `${CONFIG.API_BASE}/${this.documentId}/references?start=1&count=200`;
         console.log("Fetching references with URL:", referencesUrl);
         const response = await Utils.fetchWithRetry(referencesUrl);
         this.data.references = await response.json();
@@ -374,7 +374,10 @@
 
       markdown += this.generatePublisherFootnotes(); // 在 References 之前追加
 
-      // 添加参考文献（作为脚注）
+      // 添加参考文献（编号列表格式，与arXiv/Springer一致）
+      markdown += this.generateReferencesList();
+
+      // 添加参考文献（作为脚注格式）
       markdown += this.generateFootnotes();
 
       // 添加引用信息
@@ -1215,7 +1218,7 @@
         return "";
       }
 
-      let footnotes = "\n## References\n\n";
+      let footnotes = "\n## Reference Footnotes\n\n";
 
       // 创建引用ID到引用数据的映射
       const refMap = new Map();
@@ -1290,6 +1293,51 @@
       }
 
       return footnotes;
+    }
+
+    generateReferencesList() {
+      if (
+        !this.data.references ||
+        !this.data.references.references ||
+        !Utils.isValidArray(this.data.references.references)
+      ) {
+        return "";
+      }
+
+      let referencesList = "\n## References\n\n";
+
+      // 按order排序生成编号列表格式的References
+      const sortedReferences = [...this.data.references.references].sort(
+        (a, b) => (a.order || 0) - (b.order || 0)
+      );
+
+      sortedReferences.forEach((ref) => {
+        // 生成编号列表格式：[1] 作者, "标题", 期刊, 年份...
+        let refText = ref.text || "";
+        
+        // 清理HTML标签
+        refText = refText.replace(/<[^>]*>/g, "");
+        
+        referencesList += `[${ref.order}] ${refText}`;
+
+        // 添加链接
+        if (ref.links) {
+          if (ref.links.crossRefLink) {
+            referencesList += ` DOI: ${ref.links.crossRefLink}`;
+          } else if (ref.links.documentLink) {
+            referencesList += ` IEEE: https://ieeexplore.ieee.org${ref.links.documentLink}`;
+          }
+        }
+
+        // 添加Google Scholar链接
+        if (ref.googleScholarLink) {
+          referencesList += ` [Google Scholar](${ref.googleScholarLink})`;
+        }
+
+        referencesList += "\n\n";
+      });
+
+      return referencesList;
     }
 
     generateCitations() {
@@ -2127,6 +2175,15 @@
       this.container = null;
       this.isProcessing = false;
       this.progressBar = null;
+      
+      // 缓存系统
+      this.cache = {
+        lastPageHash: null,
+        metadata: null,
+        converter: null,
+        markdown: null,
+        images: null
+      };
     }
 
     init() {
@@ -2140,219 +2197,142 @@
         return;
       }
 
+      // Add compact CSS styling
+      const styleTag = document.createElement('style');
+      styleTag.textContent = `
+        :root {
+          --ieee-bg: #ffffff; --ieee-text: #111827; --ieee-muted: #6b7280;
+          --ieee-border: #e5e7eb; --ieee-panel: rgba(255,255,255,0.96);
+          --ieee-accent: #003B5C; --ieee-accent-600: #002847; --ieee-shadow: 0 12px 32px rgba(0,0,0,.15);
+        }
+        @media (prefers-color-scheme: dark) {
+          :root { --ieee-bg:#0f1115; --ieee-text:#e5e7eb; --ieee-muted:#9ca3af; --ieee-border:#30363d;
+                  --ieee-panel: rgba(17,17,17,.92); --ieee-accent:#0066CC; --ieee-accent-600:#0052a3; --ieee-shadow:0 16px 40px rgba(0,0,0,.4); }
+        }
+        .ieee-md-panel {
+          position: fixed; right: 16px; bottom: 16px; z-index: 9999;
+          font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Noto Sans CJK SC";
+          background: var(--ieee-panel); color: var(--ieee-text);
+          border: 1px solid var(--ieee-border); border-radius: 12px;
+          padding: 10px 10px; box-shadow: var(--ieee-shadow);
+          backdrop-filter: saturate(1.1) blur(6px);
+          user-select: none;
+        }
+        .ieee-md-panel__head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:0 0 8px 0}
+        .ieee-md-panel__title{margin:0;font-size:13px;letter-spacing:.2px;font-weight:700;display:inline-flex;align-items:center;gap:6px}
+        .ieee-md-badge{display:inline-block;padding:2px 6px;font-size:11px;font-weight:700;color:#fff;background:var(--ieee-accent);border-radius:999px}
+        .ieee-md-panel__drag{cursor:grab;opacity:.9;font-size:11px;color:var(--ieee-muted)}
+        .ieee-md-panel__drag:active{cursor:grabbing}
+        .ieee-md-panel__btns{display:flex;flex-wrap:wrap;gap:6px}
+        .ieee-md-btn{margin:0;padding:6px 10px;border:0;border-radius:8px;cursor:pointer;background:var(--ieee-accent);color:#fff;font-weight:700;font-size:12px;box-shadow:0 1px 0 rgba(0,0,0,.08)}
+        .ieee-md-btn:hover{background:var(--ieee-accent-600)}
+        .ieee-md-btn:focus-visible{outline:2px solid #fff;outline-offset:2px}
+        .ieee-md-btn--secondary{background:transparent;color:var(--ieee-text);border:1px solid var(--ieee-border)}
+        .ieee-md-btn--secondary:hover{background:rgba(0,0,0,.05)}
+        .ieee-md-btn--ghost{background:transparent;color:var(--ieee-muted)}
+        .ieee-md-btn--ghost:hover{color:var(--ieee-text)}
+        .ieee-md-hide{display:none!important}
+
+        /* Debug Log Panel */
+        .ieee-md-log{margin-top:8px;border:1px solid var(--ieee-border);border-radius:8px;background:rgba(0,0,0,.02)}
+        .ieee-md-log__header{display:flex;justify-content:space-between;align-items:center;padding:6px 8px;border-bottom:1px solid var(--ieee-border);background:rgba(0,0,0,.03)}
+        .ieee-md-log__title{font-size:11px;font-weight:700;color:var(--ieee-muted)}
+        .ieee-md-log__actions{display:flex;gap:4px}
+        .ieee-md-log__btn{padding:2px 6px;font-size:10px;border:0;border-radius:4px;cursor:pointer;background:transparent;color:var(--ieee-muted);font-weight:500}
+        .ieee-md-log__btn:hover{color:var(--ieee-text);background:rgba(0,0,0,.05)}
+        .ieee-md-log__content{height:120px;overflow-y:auto;padding:6px 8px;font-family:ui-monospace,SFMono-Regular,Monaco,Consolas,"Liberation Mono","Courier New",monospace;font-size:10px;line-height:1.3;white-space:pre-wrap;word-break:break-word;color:var(--ieee-text);background:#fff0}
+        @media (prefers-color-scheme: dark){.ieee-md-log{background:rgba(255,255,255,.02)}.ieee-md-log__header{background:rgba(255,255,255,.03)}.ieee-md-log__content{background:rgba(0,0,0,.1)}}
+
+        /* Footer */
+        .ieee-md-footer{margin-top:8px;padding-top:6px;border-top:1px solid var(--ieee-border);text-align:center;font-size:10px;color:var(--ieee-muted)}
+        .ieee-md-footer a{color:var(--ieee-accent);text-decoration:none}
+        .ieee-md-footer a:hover{text-decoration:underline}
+      `;
+      document.head.appendChild(styleTag);
+
       // 创建按钮容器
       this.container = document.createElement("div");
       this.container.id = CONFIG.BUTTON_CONTAINER_ID;
-      this.container.style.cssText = `
-                position: fixed;
-                top: 100px;
-                right: 20px;
-                z-index: 9999;
-                background: white;
-                padding: 15px;
-                border-radius: 12px;
-                box-shadow: 0 8px 32px rgba(0, 59, 92, 0.15), 0 4px 16px rgba(0, 59, 92, 0.1);
-                display: flex;
-                flex-direction: column;
-                gap: 12px;
-                min-width: 260px;
-                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-                border: 1px solid rgba(0, 59, 92, 0.1);
-            `;
+      this.container.className = 'ieee-md-panel';
 
-      // 创建标题
-      const title = document.createElement("div");
-      title.innerHTML = `
-                <div style="display: flex; align-items: center; margin-bottom: 10px;">
-                    <svg style="width: 28px; height: 28px; margin-right: 10px;" viewBox="0 0 24 24" fill="none" stroke="${CONFIG.COLORS.primary}" stroke-width="2">
-                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
-                        <polyline points="14 2 14 8 20 8"></polyline>
-                        <line x1="16" y1="13" x2="8" y2="13"></line>
-                        <line x1="16" y1="17" x2="8" y2="17"></line>
-                        <polyline points="10 9 9 9 8 9"></polyline>
-                    </svg>
-                    <span style="font-weight: 700; color: ${CONFIG.COLORS.primary}; font-size: 18px;">Export Paper</span>
-                </div>
-                <div style="font-size: 12px; color: #666; margin-bottom: 8px;">IEEE Paper to Markdown Converter</div>
-            `;
-      this.container.appendChild(title);
+      this.container.innerHTML = `
+        <div class="ieee-md-panel__head">
+          <div class="ieee-md-panel__title">
+            <span class="ieee-md-badge">IEEE</span>
+            <span>Markdown Export</span>
+          </div>
+          <button class="ieee-md-btn ieee-md-btn--ghost" data-action="toggle">折叠</button>
+          <span class="ieee-md-panel__drag" title="拖拽移动位置">⇕</span>
+        </div>
+        <div class="ieee-md-panel__btns" data-role="buttons">
+          <button class="ieee-md-btn" data-action="preview" data-mode="links">Preview · Links</button>
+          <button class="ieee-md-btn ieee-md-btn--secondary" data-action="preview" data-mode="base64">Preview · Base64</button>
+          <button class="ieee-md-btn" data-action="links">Export · Links</button>
+          <button class="ieee-md-btn" data-action="base64">Export · Base64</button>
+          <button class="ieee-md-btn ieee-md-btn--secondary" data-action="textbundle">Export · TextBundle</button>
+          <button class="ieee-md-btn ieee-md-btn--ghost" data-action="debug-log">Debug Log</button>
+        </div>
+        <div class="ieee-md-log ieee-md-hide" data-role="debug-log">
+          <div class="ieee-md-log__header">
+            <span class="ieee-md-log__title">调试日志</span>
+            <div class="ieee-md-log__actions">
+              <button class="ieee-md-log__btn" data-action="clear-log">清空</button>
+              <button class="ieee-md-log__btn" data-action="copy-log">复制</button>
+            </div>
+          </div>
+          <div class="ieee-md-log__content"></div>
+        </div>
+        <div class="ieee-md-footer">
+          © Qi Deng - <a href="https://github.com/nerdneilsfield/neils-monkey-scripts/" target="_blank">GitHub</a>
+        </div>
+      `;
 
-      // 创建 TextBundle 按钮
-      const textBundleBtn = this.createButton(
-        "export-textbundle",
-        "📦 TextBundle (.zip)",
-        "Complete package with images",
-        CONFIG.COLORS.primary
-      );
-      this.container.appendChild(textBundleBtn);
+      // Setup event listeners for compact UI
+      const btns = this.container.querySelector('[data-role="buttons"]');
+      this.container.querySelector('[data-action="toggle"]')?.addEventListener('click', () => {
+        btns.classList.toggle('ieee-md-hide');
+        const debugLog = this.container.querySelector('[data-role="debug-log"]');
+        const footer = this.container.querySelector('.ieee-md-footer');
+        debugLog?.classList.add('ieee-md-hide');
+        footer?.classList.toggle('ieee-md-hide');
+      });
 
-      // 创建 Base64 Markdown 按钮
-      const base64Btn = this.createButton(
-        "export-base64",
-        "📄 Markdown (Base64)",
-        "Single file with embedded images",
-        CONFIG.COLORS.secondary
-      );
-      this.container.appendChild(base64Btn);
+      // Debug log toggle
+      this.container.querySelector('[data-action="debug-log"]')?.addEventListener('click', () => {
+        const debugLog = this.container.querySelector('[data-role="debug-log"]');
+        debugLog?.classList.toggle('ieee-md-hide');
+      });
 
-      // 创建纯 Markdown 按钮
-      const markdownBtn = this.createButton(
-        "export-markdown",
-        "📝 Markdown (Links)",
-        "Lightweight with image links",
-        CONFIG.COLORS.accent
-      );
-      this.container.appendChild(markdownBtn);
+      // Clear log
+      this.container.querySelector('[data-action="clear-log"]')?.addEventListener('click', () => {
+        const logContent = this.container.querySelector('.ieee-md-log__content');
+        if (logContent) logContent.textContent = '';
+      });
 
-      const copyBtn = this.createButton(
-        "copy-markdown",
-        "📋 Copy Markdown (Links)",
-        "Copy to clipboard",
-        CONFIG.COLORS.accent
-      );
-      this.container.appendChild(copyBtn);
+      // Copy log
+      this.container.querySelector('[data-action="copy-log"]')?.addEventListener('click', () => {
+        const logContent = this.container.querySelector('.ieee-md-log__content');
+        if (logContent && navigator.clipboard) {
+          navigator.clipboard.writeText(logContent.textContent || '');
+        }
+      });
 
-      // 创建进度条
-      this.progressBar = document.createElement("div");
-      this.progressBar.style.cssText = `
-                margin-top: 12px;
-                height: 6px;
-                background: #e8f2ff;
-                border-radius: 3px;
-                overflow: hidden;
-                display: none;
-                border: 1px solid rgba(0, 59, 92, 0.1);
-            `;
-      this.progressBar.innerHTML = `
-                <div id="export-progress-fill" style="
-                    height: 100%;
-                    background: linear-gradient(90deg, ${CONFIG.COLORS.primary}, ${CONFIG.COLORS.accent});
-                    width: 0%;
-                    transition: width 0.4s ease;
-                    border-radius: 2px;
-                "></div>
-            `;
-      this.container.appendChild(this.progressBar);
-
-      // 创建状态显示区域
-      const status = document.createElement("div");
-      status.id = "export-status";
-      status.style.cssText = `
-                margin-top: 10px;
-                padding: 10px 14px;
-                border-radius: 8px;
-                font-size: 13px;
-                display: none;
-                line-height: 1.5;
-                font-weight: 500;
-            `;
-      this.container.appendChild(status);
-
-      // 最小化/展开按钮
-      const toggleBtn = document.createElement("button");
-      toggleBtn.style.cssText = `
-                position: absolute;
-                top: 12px;
-                right: 12px;
-                background: none;
-                border: none;
-                cursor: pointer;
-                padding: 6px;
-                color: ${CONFIG.COLORS.primary};
-                font-size: 18px;
-                font-weight: bold;
-                border-radius: 4px;
-                transition: all 0.2s ease;
-            `;
-      toggleBtn.innerHTML = "−";
-      toggleBtn.onmouseenter = () =>
-        (toggleBtn.style.background = "rgba(0, 59, 92, 0.1)");
-      toggleBtn.onmouseleave = () => (toggleBtn.style.background = "none");
-      toggleBtn.onclick = () => this.toggleMinimize();
-      this.container.appendChild(toggleBtn);
-
-      // Debug Log 面板
-      const logWrap = document.createElement("details");
-      logWrap.id = "export-log-wrap";
-      logWrap.style.cssText =
-        "margin-top:8px; border:1px solid rgba(0,59,92,0.1); border-radius:8px; background:#fafcff;";
-      logWrap.open = false;
-      logWrap.innerHTML = `
-  <summary style="cursor:pointer; padding:8px 12px; color:${CONFIG.COLORS.primary}; font-weight:600;">Debug Log</summary>
-  <pre id="export-debug-log" style="max-height:220px; overflow:auto; margin:0; padding:8px 12px; font-size:12px; line-height:1.5; white-space:pre-wrap;"></pre>
-`;
-      this.container.appendChild(logWrap);
+      // Store reference to log content for updating
+      this.logContent = this.container.querySelector('.ieee-md-log__content');
 
       // …创建按钮们后：把需要被折叠的元素登记起来
       this.sections = [
-        textBundleBtn,
-        base64Btn,
-        markdownBtn,
-        document.getElementById("copy-markdown"), // 新增的复制按钮
-        this.progressBar,
-        document.getElementById("export-status"),
-        document.getElementById("export-log-wrap"), // Debug Log 面板
+        btns,
+        this.container.querySelector('[data-role="debug-log"]'),
+        this.container.querySelector('.ieee-md-footer')
       ].filter(Boolean);
 
       // 保存 toggle 引用 & 状态位
-      this.toggleBtn = toggleBtn;
+      this.toggleBtn = this.container.querySelector('[data-action="toggle"]');
       this.minimized = false;
 
       // 添加到页面
       document.body.appendChild(this.container);
-    }
-
-    createButton(id, text, description, color) {
-      const button = document.createElement("button");
-      button.id = id;
-      button.style.cssText = `
-                padding: 14px 18px;
-                background: linear-gradient(135deg, ${color} 0%, ${this.darkenColor(
-        color,
-        0.1
-      )} 100%);
-                color: white;
-                border: none;
-                border-radius: 8px;
-                cursor: pointer;
-                font-size: 14px;
-                font-weight: 600;
-                transition: all 0.3s ease;
-                text-align: left;
-                position: relative;
-                overflow: hidden;
-                box-shadow: 0 2px 8px rgba(0, 59, 92, 0.2);
-            `;
-
-      button.innerHTML = `
-                <div style="font-weight: 700; margin-bottom: 2px;">${text}</div>
-                <div style="font-size: 11px; opacity: 0.9; font-weight: 400;">${description}</div>
-            `;
-
-      // 添加悬停效果
-      button.onmouseenter = () => {
-        if (!this.isProcessing) {
-          button.style.transform = "translateY(-2px)";
-          button.style.boxShadow = `0 6px 20px rgba(0, 59, 92, 0.3)`;
-          button.style.background = `linear-gradient(135deg, ${this.lightenColor(
-            color,
-            0.1
-          )} 0%, ${color} 100%)`;
-        }
-      };
-
-      button.onmouseleave = () => {
-        if (!this.isProcessing) {
-          button.style.transform = "translateY(0)";
-          button.style.boxShadow = "0 2px 8px rgba(0, 59, 92, 0.2)";
-          button.style.background = `linear-gradient(135deg, ${color} 0%, ${this.darkenColor(
-            color,
-            0.1
-          )} 100%)`;
-        }
-      };
-
-      return button;
     }
 
     // 辅助函数：使颜色变暗
@@ -2377,15 +2357,67 @@
 
     appendLog(msg) {
       try {
-        const el = document.getElementById("export-debug-log");
-        if (!el) return;
+        if (!this.logContent) return;
         const ts = new Date().toISOString().replace("T", " ").replace("Z", "");
         const line = `[${ts}] ${msg}\n`;
-        el.textContent += line;
-        el.parentElement.scrollTop = el.parentElement.scrollHeight;
-        if (CONFIG.DEBUG) console.log("[TextPack]", msg);
+        this.logContent.textContent += line;
+        this.logContent.scrollTop = this.logContent.scrollHeight;
+        if (CONFIG.DEBUG) console.log("[IEEE Export]", msg);
       } catch (e) {
         /* noop */
+      }
+    }
+
+    // 缓存相关方法
+    _getPageHash() {
+      const title = document.title || '';
+      const bodyLength = document.body ? document.body.textContent.length : 0;
+      const metadata = Utils.getMetadata();
+      const articleNumber = metadata?.articleNumber || '';
+      return `${title}-${bodyLength}-${articleNumber}`;
+    }
+
+    async _buildBaseCache() {
+      this.appendLog('🔄 Building base cache...');
+      
+      const documentId = Utils.getDocumentId();
+      if (!documentId) throw new Error("Could not find document ID");
+      
+      const fetcher = new DataFetcher(documentId);
+      const t0 = performance.now();
+      const data = await fetcher.fetchAll();
+      
+      const converter = new IEEEMarkdownConverter(data);
+      const markdown = await converter.convert();
+      const images = converter.images || [];
+      
+      // Store in cache
+      this.cache.metadata = data.metadata;
+      this.cache.converter = converter;
+      this.cache.markdown = markdown;
+      this.cache.images = images;
+      this.cache.lastPageHash = this._getPageHash();
+      
+      const dt = (performance.now() - t0).toFixed(1);
+      this.appendLog(`✅ Base cache built: ${markdown.length} chars, ${images.length} images (${dt}ms)`);
+      return { data, converter, markdown, images };
+    }
+
+    async _getCachedOrBuild() {
+      const currentHash = this._getPageHash();
+      const cacheValid = this.cache.lastPageHash === currentHash && this.cache.markdown;
+      
+      if (cacheValid) {
+        this.appendLog('⚡ Using cached data for faster processing');
+        return {
+          data: { metadata: this.cache.metadata },
+          converter: this.cache.converter,
+          markdown: this.cache.markdown,
+          images: this.cache.images
+        };
+      } else {
+        this.appendLog('💾 Cache invalid or missing, rebuilding...');
+        return await this._buildBaseCache();
       }
     }
 
@@ -2456,36 +2488,133 @@
     }
 
     attachEventListeners() {
-      // TextBundle 按钮事件
-      document
-        .getElementById("export-textbundle")
-        ?.addEventListener("click", async () => {
-          if (this.isProcessing) return;
-          await this.handleExport("textbundle");
+      // Event delegation for all button clicks
+      this.container.addEventListener('click', async (e) => {
+        const button = e.target.closest('[data-action]');
+        if (!button) return;
+        
+        const action = button.dataset.action;
+        const mode = button.dataset.mode;
+        
+        if (this.isProcessing && !['toggle', 'debug-log', 'clear-log', 'copy-log'].includes(action)) {
+          return;
+        }
+        
+        switch (action) {
+          case 'preview':
+            await this.handlePreview(mode);
+            break;
+          case 'links':
+            await this.handleExport("markdown");
+            break;
+          case 'base64':
+            await this.handleExport("base64");
+            break;
+          case 'textbundle':
+            await this.handleExport("textbundle");
+            break;
+          case 'toggle':
+            // Already handled in createButtons
+            break;
+          case 'debug-log':
+            // Already handled in createButtons
+            break;
+          case 'clear-log':
+            // Already handled in createButtons
+            break;
+          case 'copy-log':
+            // Already handled in createButtons
+            break;
+        }
+      });
+    }
+    
+    async handlePreview(mode) {
+      this.isProcessing = true;
+      this.updateStatus("🔍 Generating preview...", "info");
+      this.appendLog(`preview:start mode=${mode}`);
+      
+      try {
+        // Use cache-aware data retrieval
+        const { data, converter, markdown, images } = await this._getCachedOrBuild();
+        
+        let finalMarkdown;
+        if (mode === 'base64') {
+          this.appendLog("base64:preview-start");
+          const b64gen = new Base64MarkdownGenerator(
+            markdown,
+            images,
+            () => {}, // no progress callback needed for preview
+            (m) => this.appendLog(m)
+          );
+          finalMarkdown = await b64gen.generate();
+          this.appendLog(`base64:preview-done len=${finalMarkdown.length}`);
+        } else {
+          finalMarkdown = markdown;
+        }
+        
+        this.showPreview(finalMarkdown, mode);
+        this.appendLog(`preview:done mode=${mode} len=${finalMarkdown.length}`);
+        
+      } catch (error) {
+        this.updateStatus(`❌ Preview failed: ${error.message}`, "error");
+        this.appendLog(`preview:error ${error.message}`);
+      } finally {
+        this.isProcessing = false;
+        this.enableButtons();
+      }
+    }
+    
+    showPreview(content, mode) {
+      // Create or get preview modal
+      let overlay = document.querySelector('.ieee-preview-overlay');
+      let modal = document.querySelector('.ieee-preview-modal');
+      
+      if (!overlay || !modal) {
+        overlay = document.createElement('div');
+        overlay.className = 'ieee-preview-overlay';
+        overlay.style.cssText = `
+          position: fixed; inset: 0; background: rgba(0,0,0,.35); z-index: 10000; display: flex;
+          align-items: center; justify-content: center;
+        `;
+        
+        modal = document.createElement('div');
+        modal.className = 'ieee-preview-modal';
+        modal.style.cssText = `
+          background: white; border-radius: 12px; width: 90%; height: 80%; max-width: 1000px;
+          box-shadow: 0 20px 60px rgba(0,0,0,.3); display: flex; flex-direction: column;
+          overflow: hidden;
+        `;
+        
+        modal.innerHTML = `
+          <div style="padding: 16px; border-bottom: 1px solid #ddd; display: flex; justify-content: space-between; align-items: center;">
+            <h3 style="margin: 0; color: #003B5C;">Preview - ${mode}</h3>
+            <button class="close-preview" style="background: none; border: none; font-size: 24px; cursor: pointer;">&times;</button>
+          </div>
+          <div style="flex: 1; overflow: auto; padding: 16px;">
+            <pre style="white-space: pre-wrap; font-family: monospace; line-height: 1.4;">${content}</pre>
+          </div>
+        `;
+        
+        overlay.appendChild(modal);
+        document.body.appendChild(overlay);
+        
+        // Close handlers
+        overlay.addEventListener('click', (e) => {
+          if (e.target === overlay) {
+            overlay.remove();
+          }
         });
-
-      // Base64 按钮事件
-      document
-        .getElementById("export-base64")
-        ?.addEventListener("click", async () => {
-          if (this.isProcessing) return;
-          await this.handleExport("base64");
+        
+        modal.querySelector('.close-preview').addEventListener('click', () => {
+          overlay.remove();
         });
-
-      // 纯 Markdown 按钮事件
-      document
-        .getElementById("export-markdown")
-        ?.addEventListener("click", async () => {
-          if (this.isProcessing) return;
-          await this.handleExport("markdown");
-        });
-
-      document
-        .getElementById("copy-markdown")
-        ?.addEventListener("click", async () => {
-          if (this.isProcessing) return;
-          await this.handleExport("copy-markdown");
-        });
+      } else {
+        // Update existing modal
+        modal.querySelector('h3').textContent = `Preview - ${mode}`;
+        modal.querySelector('pre').textContent = content;
+        overlay.style.display = 'flex';
+      }
     }
 
     async copyTextToClipboard(text) {
@@ -2521,29 +2650,11 @@
       this.appendLog(`export:start type=${type}`);
 
       try {
-        const documentId = Utils.getDocumentId();
-        if (!documentId) throw new Error("Could not find document ID");
-
-        this.updateStatus("📥 Fetching document data...", "info");
+        // Use cache-aware data retrieval  
+        this.updateStatus("📦 Loading data (with caching)...", "info");
         this.showProgress(15);
-        this.appendLog(`fetch:start doc=${documentId}`);
-
-        const fetcher = new DataFetcher(documentId);
-        const t0 = performance.now();
-        const data = await fetcher.fetchAll();
-        this.appendLog(
-          `fetch:done dt=${(performance.now() - t0).toFixed(1)}ms`
-        );
-        this.showProgress(35);
-
-        this.updateStatus("🔄 Converting to Markdown...", "info");
-        this.appendLog("convert:start");
-        const converter = new IEEEMarkdownConverter(data);
-        const markdown = await converter.convert();
-        const images = converter.images || [];
-        this.appendLog(
-          `convert:done len=${markdown.length} images=${images.length}`
-        );
+        
+        const { data, converter, markdown, images } = await this._getCachedOrBuild();
         this.showProgress(50);
 
         const metadata = data.metadata || {};
@@ -2632,78 +2743,49 @@
     }
 
     showProgress(percent) {
-      this.progressBar.style.display = "block";
-      const fill = document.getElementById("export-progress-fill");
-      if (fill) {
-        fill.style.width = `${percent}%`;
+      // For compact UI, show progress in log only
+      if (percent % 20 === 0 || percent === 100) {
+        this.appendLog(`Progress: ${Math.min(100, Math.max(0, percent))}%`);
       }
     }
 
     hideProgress() {
-      setTimeout(() => {
-        if (this.progressBar) {
-          this.progressBar.style.display = "none";
-          const fill = document.getElementById("export-progress-fill");
-          if (fill) {
-            fill.style.width = "0%";
-          }
-        }
-      }, 300);
+      // No explicit progress bar in compact UI
     }
 
     updateStatus(message, type) {
-      const status = document.getElementById("export-status");
-      if (!status) return;
-
-      status.innerHTML = message;
-      status.style.display = "block";
-
-      // 设置样式
-      switch (type) {
-        case "info":
-          status.style.background = `linear-gradient(135deg, rgba(0, 59, 92, 0.1) 0%, rgba(0, 160, 223, 0.1) 100%)`;
-          status.style.color = CONFIG.COLORS.primary;
-          status.style.border = `1px solid rgba(0, 59, 92, 0.2)`;
-          break;
-        case "success":
-          status.style.background = `linear-gradient(135deg, rgba(40, 167, 69, 0.1) 0%, rgba(40, 167, 69, 0.2) 100%)`;
-          status.style.color = CONFIG.COLORS.success;
-          status.style.border = `1px solid rgba(40, 167, 69, 0.3)`;
-          break;
-        case "error":
-          status.style.background = `linear-gradient(135deg, rgba(220, 53, 69, 0.1) 0%, rgba(220, 53, 69, 0.2) 100%)`;
-          status.style.color = CONFIG.COLORS.error;
-          status.style.border = `1px solid rgba(220, 53, 69, 0.3)`;
-          break;
-      }
+      // For compact UI, show status in log with appropriate emoji
+      const statusEmoji = {
+        info: "ℹ️",
+        success: "✅",
+        error: "❌", 
+        warning: "⚠️"
+      };
+      
+      const emoji = statusEmoji[type] || "📋";
+      this.appendLog(`${emoji} ${message}`);
     }
 
     hideStatus() {
-      const status = document.getElementById("export-status");
-      if (status) {
-        status.style.display = "none";
-      }
+      // No explicit status area in compact UI
     }
 
     disableButtons() {
-      this.container.querySelectorAll("button").forEach((btn) => {
-        if (btn.id && btn.id.startsWith("export-")) {
-          btn.disabled = true;
-          btn.style.opacity = "0.6";
-          btn.style.cursor = "not-allowed";
-          btn.style.transform = "none";
-          btn.style.boxShadow = "none";
+      this.container.querySelectorAll(".ieee-md-btn").forEach((btn) => {
+        if (!btn.dataset.action || ['toggle', 'debug-log', 'clear-log', 'copy-log'].includes(btn.dataset.action)) {
+          return; // Don't disable these buttons
         }
+        btn.disabled = true;
+        btn.style.opacity = "0.6";
+        btn.style.cursor = "not-allowed";
       });
     }
 
     enableButtons() {
-      this.container.querySelectorAll("button").forEach((btn) => {
-        if (btn.id && btn.id.startsWith("export-")) {
-          btn.disabled = false;
-          btn.style.opacity = "1";
-          btn.style.cursor = "pointer";
-        }
+      this.container.querySelectorAll(".ieee-md-btn").forEach((btn) => {
+        btn.disabled = false;
+        btn.style.opacity = "1";
+        btn.style.cursor = "pointer";
       });
     }
 
