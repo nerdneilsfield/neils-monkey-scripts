@@ -170,6 +170,12 @@
 
             // 供 walk 时使用
             this._citeMap = new Map();
+            // 存储预提取的表格内容（避免弹窗覆盖问题）
+            this._extractedTables = new Map();
+            // 存储动态捕获的表格内容
+            this._dynamicTables = new Map();
+            // DOM变化监听器
+            this._dynamicObserver = null;
         }
 
         // ===== 工具 =====
@@ -785,14 +791,146 @@
             return { type: isDisplay ? 'display' : 'inline', tex: tagNo ? `${tex} \\tag{${tagNo}}` : tex };
         }
 
-        // —— 识别“表格型 figure”与容器：MDPI 我们直接在 walk 阶段分流，这里给默认实现即可 —— 
+        // —— 识别"表格型 figure"与容器：MDPI 我们直接在 walk 阶段分流，这里给默认实现即可 —— 
         isTableLikeFigure(node) { return !!(node && node.querySelector && node.querySelector('table')); }
-        isTableContainer(node) { return !!(node && node.matches && node.matches('div.html-table-wrap, div.table-wrap')); }
+        isTableContainer(node) { 
+            if (!node || !node.matches) {
+                Log.info(`❌ isTableContainer: Node invalid - node exists: ${!!node}, has matches: ${!!(node && node.matches)}`);
+                return false;
+            }
+            
+            const nodeId = node.getAttribute?.('id') || 'no-id';
+            const nodeClass = node.className || 'no-class';
+            const nodeTag = node.tagName || 'no-tag';
+            
+            Log.info(`🔍 isTableContainer check: ${nodeTag}.${nodeClass}#${nodeId}`);
+            
+            // Original detection for wrapped tables
+            if (node.matches('div.html-table-wrap, div.table-wrap')) {
+                Log.info(`✅ isTableContainer: MATCHED as html-table-wrap`);
+                return true;
+            }
+            
+            // Enhanced detection for popup expanded content
+            if (node.matches('div.mfp-content .html-table_show')) {
+                Log.info(`✅ isTableContainer: MATCHED as mfp-content table`);
+                return true;
+            }
+            
+            // Also detect popup content containers
+            if (node.matches('div.html-table_show[id*="table_body_display"]')) {
+                Log.info(`✅ isTableContainer: MATCHED as popup display container`);
+                return true;
+            }
+            
+            Log.info(`❌ isTableContainer: NO MATCH`);
+            return false;
+        }
 
         // —— 提取：表 ——（与 SpringerAdapter 同款策略：简单表 → Markdown，复杂/超宽 → 内嵌 HTML）
         async extractTable(node) {
-            const table = node.tagName?.toLowerCase() === 'table' ? node : node.querySelector?.('table');
-            if (!table) return { html: node.outerHTML };
+            const nodeId = node.getAttribute?.('id') || 'unknown-node';
+            const nodeClass = node.className || 'no-class';
+            const nodeTag = node.tagName || 'unknown-tag';
+            
+            Log.info(`🔍 EXTRACT TABLE called for: ${nodeTag}.${nodeClass}#${nodeId}`);
+            
+            // PRIORITY 0: Check if we have pre-extracted content from sequential processing
+            Log.info(`📊 CHECKING pre-extracted storage:`);
+            Log.info(`  → Storage map size: ${this._extractedTables.size} entries`);
+            Log.info(`  → Node in storage: ${this._extractedTables.has(node)}`);
+            
+            if (this._extractedTables.size > 0) {
+                Log.info(`  → Storage contents:`);
+                let index = 0;
+                for (const [storedNode, content] of this._extractedTables.entries()) {
+                    const storedId = storedNode.getAttribute?.('id') || 'no-id';
+                    const storedClass = storedNode.className || 'no-class';
+                    const isSameNode = storedNode === node;
+                    Log.info(`    → Entry ${index + 1}: ${storedClass}#${storedId}, same=${isSameNode}, timestamp=${content.timestamp}`);
+                    index++;
+                }
+            }
+            
+            if (this._extractedTables.has(node)) {
+                const preExtracted = this._extractedTables.get(node);
+                
+                Log.info(`✅ USING PRE-EXTRACTED CONTENT:`);
+                Log.info(`  → Content timestamp: ${preExtracted.timestamp}`);
+                Log.info(`  → Content extracted: ${preExtracted.extracted}`);
+                Log.info(`  → Caption: "${preExtracted.caption}"`);
+                Log.info(`  → HTML length: ${preExtracted.html.length} characters`);
+                Log.info(`  → Has stats: ${!!preExtracted.stats}`);
+                
+                if (preExtracted.stats) {
+                    Log.info(`  → Table stats: ${preExtracted.stats.rows} rows, ${preExtracted.stats.cells} cells`);
+                    Log.info(`  → Math elements: ${preExtracted.stats.mathElements}`);
+                }
+                
+                // Return the pre-extracted content with proper formatting
+                let html = preExtracted.html;
+                if (preExtracted.caption) {
+                    html = `<div class="table-caption">${preExtracted.caption}</div>\n${html}`;
+                    Log.info(`  → Caption added to HTML output`);
+                }
+                
+                Log.info(`🎯 RETURNING pre-extracted content (${html.length} chars total)`);
+                return { html };
+            } else {
+                Log.info(`⚠️ NO PRE-EXTRACTED CONTENT found, falling back to regular extraction`);
+            }
+
+            let table;
+            let caption = '';
+            
+            // Priority 1: Look for expanded popup content if this is a table-wrap
+            if (node.matches && node.matches('div.html-table-wrap')) {
+                const popupId = this._getPopupTableId(node);
+                if (popupId) {
+                    const popupContainer = document.querySelector(popupId);
+                    if (popupContainer) {
+                        table = popupContainer.querySelector('table');
+                        // Extract caption from popup
+                        const captionEl = popupContainer.querySelector('.html-caption');
+                        if (captionEl) {
+                            caption = captionEl.textContent || '';
+                            Log.info(`Found popup table with caption: ${caption.substring(0, 50)}...`);
+                        }
+                    }
+                }
+                
+                // Also try to get caption from the original wrap
+                if (!caption) {
+                    const origCaption = node.querySelector('.html-table_wrap_discription');
+                    if (origCaption) {
+                        caption = origCaption.textContent || '';
+                    }
+                }
+            }
+            
+            // Priority 2: Look for popup content containers
+            if (!table && node.matches && node.matches('div.html-table_show[id*="table_body_display"]')) {
+                table = node.querySelector('table');
+                const captionEl = node.querySelector('.html-caption');
+                if (captionEl) {
+                    caption = captionEl.textContent || '';
+                }
+            }
+            
+            // Priority 3: Direct table element (original logic)
+            if (!table) {
+                table = node.tagName?.toLowerCase() === 'table' ? node : node.querySelector?.('table');
+            }
+            
+            if (!table) {
+                Log.warn('No table found in node, returning node HTML');
+                return { html: node.outerHTML };
+            }
+            
+            Log.info(`Processing table with ${table.querySelectorAll('tr').length} rows`);
+            if (caption) {
+                Log.info(`Table caption: ${caption.substring(0, 100)}...`);
+            }
 
             // 1) 判定是否直接回退为 HTML（更稳）
             const hasSpan = table.querySelector('td[rowspan], td[colspan], th[rowspan], th[colspan]');
@@ -804,7 +942,12 @@
             const maxCols = 8;
 
             if (hasSpan || hasBlockMath || hasNestedTable || hasFigureLike || colCount > maxCols) {
-                return { html: table.outerHTML };
+                // Include caption with HTML table if available
+                let html = table.outerHTML;
+                if (caption) {
+                    html = `<div class="table-caption">${caption}</div>\n${html}`;
+                }
+                return { html };
             }
 
             // 2) 收集表头与表体（先走行内转换，再做 Markdown）
@@ -840,47 +983,51 @@
                 lines.push('| ' + row.join(' | ') + ' |');
             }
 
-            return { markdown: lines.join('\n') };
+            let markdown = lines.join('\n');
+            if (caption) {
+                markdown = `${caption}\n\n${markdown}`;
+            }
+            return { markdown };
         }
 
         // —— 检测：是否为“算法表格” —— //
         isAlgorithmTable(node) {
-            Log.info(`isAlgorithmTable called - node: ${node?.tagName || 'null'}, classes: ${node?.className || 'no-class'}`);
+            // Log.info(`isAlgorithmTable called - node: ${node?.tagName || 'null'}, classes: ${node?.className || 'no-class'}`);
             if (!node) {
-                Log.info(`isAlgorithmTable result: false (no node)`);
+                // Log.info(`isAlgorithmTable result: false (no node)`);
                 return false;
             }
             // 直接匹配自身为算法结构
             if (node.matches && node.matches('table.html-array_table, dl.html-order')) {
-                Log.info(`isAlgorithmTable result: true (direct match)`);
+                // Log.info(`isAlgorithmTable result: true (direct match)`);
                 return true;
             }
             // 向下查找表格或步骤清单
             const el = (node.tagName?.toLowerCase() === 'table') ? node : (node.querySelector?.('table') || node.querySelector?.('dl.html-order'));
             if (!el) {
-                Log.info(`isAlgorithmTable result: false (no table/dl element found)`);
+                // Log.info(`isAlgorithmTable result: false (no table/dl element found)`);
                 return false;
             }
             if (el.classList && el.classList.contains('html-array_table')) {
-                Log.info(`isAlgorithmTable result: true (has html-array_table class)`);
+                // Log.info(`isAlgorithmTable result: true (has html-array_table class)`);
                 return true;
             }
             if (el.matches && el.matches('dl.html-order')) {
-                Log.info(`isAlgorithmTable result: true (matches dl.html-order)`);
+                // Log.info(`isAlgorithmTable result: true (matches dl.html-order)`);
                 return true;
             }
             const text = (el.textContent || '').toLowerCase();
             if (/\balgorithm\s*\d+\b/.test(text)) {
-                Log.info(`isAlgorithmTable result: true (contains "algorithm N" text)`);
+                // Log.info(`isAlgorithmTable result: true (contains "algorithm N" text)`);
                 return true;
             }
-            Log.info(`isAlgorithmTable result: false (no criteria matched)`);
+            // Log.info(`isAlgorithmTable result: false (no criteria matched)`);
             return false;
         }
 
         // —— 抽取：算法表格（保持嵌入 HTML，但把单元格 MathJax/MML 转为纯文本）—— //
         extractAlgorithmTable(node) {
-            Log.info(`extractAlgorithmTable called - input node: ${node.tagName}, classes: ${node.className || 'no-class'}`);
+            // Log.info(`extractAlgorithmTable called - input node: ${node.tagName}, classes: ${node.className || 'no-class'}`);
             const table = node.tagName?.toLowerCase() === 'table' ? node : node.querySelector?.('table');
             if (!table) return { html: node.outerHTML };
             const clone = table.cloneNode(true);
@@ -980,8 +1127,8 @@
                 for (const dd of Array.from(dl.querySelectorAll(':scope > dd'))) dd.setAttribute('style', 'display:block;margin:0 0 0 2.4em;');
             }
             
-            Log.info(`extractAlgorithmTable output - HTML length: ${clone.outerHTML.length}`);
-            Log.info(`extractAlgorithmTable HTML preview: ${clone.outerHTML.substring(0, 100)}...`);
+            // Log.info(`extractAlgorithmTable output - HTML length: ${clone.outerHTML.length}`);
+            // Log.info(`extractAlgorithmTable HTML preview: ${clone.outerHTML.substring(0, 100)}...`);
             return { html: clone.outerHTML };
         }
 
@@ -1042,8 +1189,6 @@
         }
 
 
-
-
         // —— 提取：图 ——（div.html-fig-wrap → 取 data-large/original/lsrc，清洗标题）
         async extractFigure(node) {
             // node 可能是我们在 walk 里造的 <figure>，原根在 __mdpiFig；也可能未来扩展成原生 <figure>
@@ -1092,6 +1237,826 @@
             const svg = root.querySelector?.('svg');
             if (svg) return { kind: 'svg', id, inlineSvg: svg.outerHTML, caption };
             return null;
+        }
+
+        // —— 新增：展开 MDPI 表格弹窗（顺序处理避免弹窗覆盖）——
+        async expandTables() {
+            Log.info('=== STARTING SEQUENTIAL TABLE EXPANSION PROCESS ===');
+            
+            // 初始DOM状态快照
+            this._logDOMSnapshot('Initial state');
+            
+            const tableWraps = document.querySelectorAll('div.html-table-wrap');
+            Log.info(`Found ${tableWraps.length} table wrap elements`);
+            
+            // 详细分析每个table wrap
+            tableWraps.forEach((wrap, index) => {
+                const id = wrap.getAttribute('id') || 'no-id';
+                const classes = wrap.className || 'no-classes';
+                const innerHTML = wrap.innerHTML.substring(0, 200) + '...';
+                Log.info(`Table wrap ${index + 1}: ID="${id}", classes="${classes}"`);
+                Log.info(`Table wrap ${index + 1} innerHTML preview: ${innerHTML}`);
+                
+                // 分析popup link
+                const popupLink = wrap.querySelector('.html-tablepopup[href^="#table_body_display"], .html-tablepopup[data-counterslinkmanual*="display"]');
+                if (popupLink) {
+                    const href = popupLink.getAttribute('href') || 'no-href';
+                    const dataLink = popupLink.getAttribute('data-counterslinkmanual') || 'no-data-link';
+                    const linkClasses = popupLink.className || 'no-classes';
+                    Log.info(`  → Popup link found: href="${href}", data-counterslinkmanual="${dataLink}", classes="${linkClasses}"`);
+                    
+                    // 检查可点击元素
+                    const clickableElement = popupLink.querySelector('a') || popupLink;
+                    Log.info(`  → Clickable element: ${clickableElement.tagName}.${clickableElement.className || 'no-class'}`);
+                } else {
+                    Log.warn(`  → No popup link found in table wrap ${index + 1}`);
+                }
+            });
+            
+            let successful = 0;
+            
+            // 顺序处理每个表格（避免弹窗内容被覆盖）
+            for (let i = 0; i < tableWraps.length; i++) {
+                const wrap = tableWraps[i];
+                const wrapId = wrap.getAttribute('id') || `table-${i}`;
+                
+                Log.info(`\n=== PROCESSING TABLE ${i + 1}/${tableWraps.length}: ${wrapId} ===`);
+                
+                const popupLink = wrap.querySelector('.html-tablepopup[href^="#table_body_display"], .html-tablepopup[data-counterslinkmanual*="display"]');
+                if (popupLink) {
+                    const href = popupLink.getAttribute('href') || popupLink.getAttribute('data-counterslinkmanual');
+                    Log.info(`Processing table with popup link: ${href}`);
+                    
+                    try {
+                        await this._processTableSequentially(wrap, popupLink);
+                        successful++;
+                        Log.info(`✅ Successfully processed table ${wrapId} (${successful}/${tableWraps.length})`);
+                    } catch (error) {
+                        Log.error(`❌ Failed to process table ${wrapId}:`, error);
+                    }
+                } else {
+                    Log.warn(`⚠️ No popup link found in table wrap ${wrapId} - skipping`);
+                }
+            }
+            
+            Log.info(`\n=== SEQUENTIAL TABLE EXPANSION COMPLETED ===`);
+            Log.info(`✅ Successful: ${successful}/${tableWraps.length}`);
+            Log.info(`❌ Failed: ${tableWraps.length - successful}/${tableWraps.length}`);
+            Log.info(`📊 Pre-extracted tables stored: ${this._extractedTables.size}`);
+            Log.info(`📊 Dynamic tables ready for Controller: ${this._dynamicTables.size}`);
+            
+            // 最终DOM状态快照
+            this._logDOMSnapshot('Final state');
+            
+            // 启动动态表格监听系统
+            this._setupDynamicTableCapture();
+            Log.info('🚀 Dynamic table monitoring activated');
+        }
+
+        async _processTableSequentially(wrap, popupLink) {
+            const tableId = wrap.getAttribute('id') || 'unknown-table';
+            const href = popupLink.getAttribute('href') || popupLink.getAttribute('data-counterslinkmanual');
+            
+            Log.info(`🔄 Processing table ${tableId} with target ${href}`);
+            
+            try {
+                // STEP 1: 点击前DOM状态分析
+                Log.info(`📊 PRE-CLICK DOM STATE:`);
+                const preClickSnapshot = {
+                    popupContainers: document.querySelectorAll('#abstract .html-table_show').length,
+                    mfpContainers: document.querySelectorAll('.mfp-content').length,
+                    visiblePopups: document.querySelectorAll('.mfp-content:not([style*="display: none"])').length,
+                    abstractElement: !!document.querySelector('#abstract'),
+                    tableWraps: document.querySelectorAll('div.html-table-wrap').length
+                };
+                Log.info(`  → Abstract containers: ${preClickSnapshot.popupContainers}`);
+                Log.info(`  → MFP containers: ${preClickSnapshot.mfpContainers}`);
+                Log.info(`  → Visible popups: ${preClickSnapshot.visiblePopups}`);
+                Log.info(`  → Abstract element exists: ${preClickSnapshot.abstractElement}`);
+                Log.info(`  → Total table wraps: ${preClickSnapshot.tableWraps}`);
+                
+                // STEP 2: 准备点击操作
+                const clickElement = popupLink.querySelector('a') || popupLink;
+                if (!clickElement) {
+                    throw new Error(`No clickable element found for table ${tableId}`);
+                }
+                
+                Log.info(`🖱️ CLICK PREPARATION:`);
+                Log.info(`  → Click target: ${clickElement.tagName}.${clickElement.className || 'no-class'}`);
+                Log.info(`  → Target href: ${clickElement.getAttribute('href') || 'no-href'}`);
+                Log.info(`  → Target visible: ${clickElement.offsetParent !== null}`);
+                Log.info(`  → Target in viewport: ${clickElement.getBoundingClientRect().top >= 0}`);
+                
+                // STEP 3: 执行点击
+                Log.info(`🖱️ EXECUTING CLICK for table ${tableId}...`);
+                clickElement.click();
+                Log.info(`✅ Click executed successfully`);
+                
+                // STEP 4: 点击后立即检查DOM变化
+                await U.delay(100); // 短暂延迟让DOM更新
+                const postClickSnapshot = {
+                    popupContainers: document.querySelectorAll('#abstract .html-table_show').length,
+                    mfpContainers: document.querySelectorAll('.mfp-content').length,
+                    visiblePopups: document.querySelectorAll('.mfp-content:not([style*="display: none"])').length,
+                    abstractTables: document.querySelectorAll('#abstract .html-table_show table').length
+                };
+                
+                Log.info(`📊 POST-CLICK DOM STATE:`);
+                Log.info(`  → Abstract containers: ${preClickSnapshot.popupContainers} → ${postClickSnapshot.popupContainers}`);
+                Log.info(`  → MFP containers: ${preClickSnapshot.mfpContainers} → ${postClickSnapshot.mfpContainers}`);
+                Log.info(`  → Visible popups: ${preClickSnapshot.visiblePopups} → ${postClickSnapshot.visiblePopups}`);
+                Log.info(`  → Abstract tables: ${postClickSnapshot.abstractTables}`);
+                
+                // STEP 5: 等待弹窗内容出现
+                const popupSelector = '#abstract .html-table_show table, .mfp-content .html-table_show table';
+                Log.info(`⏳ WAITING for popup content: ${popupSelector}`);
+                await this._waitForElement(popupSelector, 5000);
+                
+                // STEP 6: 验证弹窗内容
+                const popupContainer = document.querySelector('#abstract .html-table_show') || 
+                                       document.querySelector('.mfp-content .html-table_show');
+                
+                if (!popupContainer) {
+                    throw new Error(`Popup container not found for table ${tableId} after waiting`);
+                }
+                
+                Log.info(`✅ POPUP VERIFIED:`);
+                Log.info(`  → Container: ${popupContainer.tagName}.${popupContainer.className}`);
+                Log.info(`  → Container visible: ${popupContainer.offsetParent !== null}`);
+                Log.info(`  → Tables in container: ${popupContainer.querySelectorAll('table').length}`);
+                Log.info(`  → Captions in container: ${popupContainer.querySelectorAll('.html-caption').length}`);
+                
+                // STEP 7: 立即提取弹窗内容
+                Log.info(`📤 EXTRACTING popup content for table ${tableId}...`);
+                const extractedContent = this._extractPopupContent(popupContainer);
+                if (extractedContent) {
+                    this._extractedTables.set(wrap, extractedContent);
+                    // CRITICAL FIX: Also store in _dynamicTables for Controller processing
+                    this._dynamicTables.set(tableId, extractedContent);
+                    Log.info(`✅ Content extracted and stored successfully:`);
+                    Log.info(`  → HTML length: ${extractedContent.html.length} characters`);
+                    Log.info(`  → Caption: "${extractedContent.caption}"`);
+                    Log.info(`  → Timestamp: ${extractedContent.timestamp}`);
+                    Log.info(`  → Stored in both _extractedTables and _dynamicTables`);
+                } else {
+                    throw new Error(`Failed to extract content for table ${tableId}`);
+                }
+                
+                // STEP 8: 关闭弹窗
+                Log.info(`🔄 CLOSING popup for table ${tableId}...`);
+                this._closeCurrentPopup();
+                
+                // STEP 9: 验证清理
+                await U.delay(300);
+                const cleanupSnapshot = {
+                    popupContainers: document.querySelectorAll('#abstract .html-table_show').length,
+                    visiblePopups: document.querySelectorAll('.mfp-content:not([style*="display: none"])').length
+                };
+                Log.info(`🧹 CLEANUP VERIFICATION:`);
+                Log.info(`  → Abstract containers: ${cleanupSnapshot.popupContainers}`);
+                Log.info(`  → Visible popups: ${cleanupSnapshot.visiblePopups}`);
+                
+                Log.info(`✅ Successfully processed table ${tableId}`);
+                
+            } catch (error) {
+                Log.error(`❌ FAILED to process table ${tableId}:`, error);
+                Log.error(`  → Error type: ${error.constructor.name}`);
+                Log.error(`  → Error message: ${error.message}`);
+                
+                // 确保关闭弹窗，避免影响后续表格
+                Log.info(`🔄 Emergency cleanup for table ${tableId}...`);
+                this._closeCurrentPopup();
+                throw error;
+            }
+        }
+
+        async _waitForElement(selector, timeout = 5000) {
+            const startTime = Date.now();
+            let attempt = 0;
+            
+            Log.info(`⏳ WAITING for element: "${selector}" (timeout: ${timeout}ms)`);
+            
+            while (Date.now() - startTime < timeout) {
+                attempt++;
+                const elapsed = Date.now() - startTime;
+                const element = document.querySelector(selector);
+                
+                if (element) {
+                    const isVisible = element.offsetParent !== null;
+                    const rect = element.getBoundingClientRect();
+                    
+                    Log.info(`🔍 Wait attempt ${attempt} (${elapsed}ms): FOUND element`);
+                    Log.info(`  → Element: ${element.tagName}.${element.className || 'no-class'}`);
+                    Log.info(`  → Visible: ${isVisible}`);
+                    Log.info(`  → Position: ${rect.top}, ${rect.left}`);
+                    Log.info(`  → Size: ${rect.width}x${rect.height}`);
+                    
+                    if (isVisible) {
+                        Log.info(`  → Parent chain: ${this._getParentChain(element)}`);
+                        Log.info(`✅ Element found and visible after ${elapsed}ms (${attempt} attempts)`);
+                        return element;
+                    } else {
+                        Log.info(`  → Element found but NOT VISIBLE, continuing to wait...`);
+                    }
+                } else {
+                    // 详细分析为什么找不到元素
+                    if (attempt % 10 === 1) { // 每10次尝试记录一次详细信息
+                        Log.info(`🔍 Wait attempt ${attempt} (${elapsed}ms): NOT FOUND`);
+                        
+                        // 分析可能的选择器组件
+                        const parts = selector.split(',').map(s => s.trim());
+                        for (const part of parts) {
+                            const partElement = document.querySelector(part);
+                            Log.info(`  → Part "${part}": ${partElement ? 'EXISTS' : 'NOT FOUND'}`);
+                            if (partElement) {
+                                Log.info(`    → Visible: ${partElement.offsetParent !== null}`);
+                            }
+                        }
+                        
+                        // 检查相关容器
+                        const abstractElement = document.querySelector('#abstract');
+                        const mfpElements = document.querySelectorAll('.mfp-content');
+                        const tableShowElements = document.querySelectorAll('.html-table_show');
+                        
+                        Log.info(`  → #abstract exists: ${!!abstractElement}`);
+                        Log.info(`  → .mfp-content count: ${mfpElements.length}`);
+                        Log.info(`  → .html-table_show count: ${tableShowElements.length}`);
+                        
+                        if (tableShowElements.length > 0) {
+                            tableShowElements.forEach((el, i) => {
+                                const hasTable = el.querySelector('table');
+                                Log.info(`    → .html-table_show[${i}]: has table=${!!hasTable}, visible=${el.offsetParent !== null}`);
+                            });
+                        }
+                    }
+                }
+                
+                await U.delay(100);
+            }
+            
+            const finalElapsed = Date.now() - startTime;
+            Log.error(`❌ TIMEOUT: Element "${selector}" did not appear within ${timeout}ms`);
+            Log.error(`  → Total attempts: ${attempt}`);
+            Log.error(`  → Final elapsed: ${finalElapsed}ms`);
+            
+            // 最终状态快照
+            Log.error(`📊 FINAL DOM STATE:`);
+            Log.error(`  → #abstract: ${!!document.querySelector('#abstract')}`);
+            Log.error(`  → .mfp-content: ${document.querySelectorAll('.mfp-content').length}`);
+            Log.error(`  → .html-table_show: ${document.querySelectorAll('.html-table_show').length}`);
+            Log.error(`  → tables: ${document.querySelectorAll('table').length}`);
+            
+            throw new Error(`Element ${selector} did not appear within ${timeout}ms (${attempt} attempts)`);
+        }
+
+        _getParentChain(element, maxDepth = 5) {
+            const chain = [];
+            let current = element;
+            let depth = 0;
+            
+            while (current && depth < maxDepth) {
+                const tagName = current.tagName || 'unknown';
+                const className = current.className ? `.${current.className.split(' ').join('.')}` : '';
+                const id = current.id ? `#${current.id}` : '';
+                chain.push(`${tagName}${id}${className}`);
+                current = current.parentElement;
+                depth++;
+            }
+            
+            return chain.join(' > ');
+        }
+
+        _getPopupTableId(wrapNode) {
+            const popupLink = wrapNode.querySelector('.html-tablepopup[href^="#table_body_display"], .html-tablepopup[data-counterslinkmanual*="display"]');
+            if (!popupLink) return null;
+            
+            const href = popupLink.getAttribute('href') || popupLink.getAttribute('data-counterslinkmanual');
+            if (!href) return null;
+            
+            return href.replace(/^.*#/, '#');
+        }
+
+        _extractPopupContent(popupContainer) {
+            Log.info(`📤 STARTING content extraction from popup container`);
+            
+            try {
+                // STEP 1: 分析容器结构
+                Log.info(`📊 POPUP CONTAINER ANALYSIS:`);
+                Log.info(`  → Container: ${popupContainer.tagName}.${popupContainer.className || 'no-class'}`);
+                Log.info(`  → Container ID: ${popupContainer.id || 'no-id'}`);
+                Log.info(`  → Container visible: ${popupContainer.offsetParent !== null}`);
+                Log.info(`  → Container innerHTML length: ${popupContainer.innerHTML.length} characters`);
+                
+                // 详细分析容器内容
+                const childElements = Array.from(popupContainer.children);
+                Log.info(`  → Child elements: ${childElements.length}`);
+                childElements.forEach((child, i) => {
+                    const tag = child.tagName || 'unknown';
+                    const classes = child.className || 'no-class';
+                    const id = child.id || 'no-id';
+                    Log.info(`    → Child ${i + 1}: ${tag}.${classes}#${id}`);
+                });
+                
+                // STEP 2: 查找表格
+                const tables = popupContainer.querySelectorAll('table');
+                Log.info(`🔍 TABLE DISCOVERY:`);
+                Log.info(`  → Tables found: ${tables.length}`);
+                
+                if (tables.length === 0) {
+                    Log.warn(`❌ No table found in popup container`);
+                    Log.warn(`  → Container content preview: ${popupContainer.textContent.substring(0, 200)}...`);
+                    return null;
+                }
+                
+                // 分析每个表格
+                tables.forEach((tbl, i) => {
+                    const rows = tbl.querySelectorAll('tr').length;
+                    const cells = tbl.querySelectorAll('td, th').length;
+                    const classes = tbl.className || 'no-class';
+                    Log.info(`  → Table ${i + 1}: ${rows} rows, ${cells} cells, classes="${classes}"`);
+                });
+                
+                const table = tables[0]; // 使用第一个表格
+                Log.info(`✅ Using table 1 for extraction`);
+                
+                // STEP 3: 表格结构分析
+                Log.info(`📋 TABLE STRUCTURE ANALYSIS:`);
+                const tableStats = {
+                    rows: table.querySelectorAll('tr').length,
+                    headers: table.querySelectorAll('th').length,
+                    cells: table.querySelectorAll('td').length,
+                    thead: !!table.querySelector('thead'),
+                    tbody: !!table.querySelector('tbody'),
+                    tfoot: !!table.querySelector('tfoot'),
+                    mathElements: table.querySelectorAll('math, .MathJax').length,
+                    links: table.querySelectorAll('a').length,
+                    images: table.querySelectorAll('img').length
+                };
+                
+                Object.entries(tableStats).forEach(([key, value]) => {
+                    Log.info(`  → ${key}: ${value}`);
+                });
+                
+                // STEP 4: 标题提取
+                const captionElements = popupContainer.querySelectorAll('.html-caption');
+                Log.info(`📝 CAPTION EXTRACTION:`);
+                Log.info(`  → Caption elements found: ${captionElements.length}`);
+                
+                let caption = '';
+                if (captionElements.length > 0) {
+                    captionElements.forEach((cap, i) => {
+                        const text = cap.textContent?.trim() || '';
+                        Log.info(`  → Caption ${i + 1}: "${text}"`);
+                    });
+                    caption = captionElements[0].textContent?.trim() || '';
+                } else {
+                    // 尝试其他可能的标题选择器
+                    const altCaptionSelectors = ['.table-caption', '.caption', 'caption', 'figcaption'];
+                    for (const selector of altCaptionSelectors) {
+                        const altCaption = popupContainer.querySelector(selector);
+                        if (altCaption) {
+                            caption = altCaption.textContent?.trim() || '';
+                            Log.info(`  → Alternative caption found (${selector}): "${caption}"`);
+                            break;
+                        }
+                    }
+                }
+                
+                if (!caption) {
+                    Log.info(`  → No caption found`);
+                }
+                
+                // STEP 5: 表格克隆和处理
+                Log.info(`🔄 CLONING table for extraction...`);
+                const tableClone = table.cloneNode(true);
+                
+                // 验证克隆
+                const cloneStats = {
+                    rows: tableClone.querySelectorAll('tr').length,
+                    cells: tableClone.querySelectorAll('td, th').length,
+                    htmlLength: tableClone.outerHTML.length
+                };
+                
+                Log.info(`✅ CLONE VERIFICATION:`);
+                Log.info(`  → Original rows: ${tableStats.rows}, Clone rows: ${cloneStats.rows}`);
+                Log.info(`  → Original cells: ${tableStats.cells}, Clone cells: ${cloneStats.cells}`);
+                Log.info(`  → Clone HTML length: ${cloneStats.htmlLength} characters`);
+                
+                // STEP 6: 生成提取结果
+                const extractedContent = {
+                    html: tableClone.outerHTML,
+                    caption: caption,
+                    extracted: true,
+                    timestamp: Date.now(),
+                    stats: {
+                        ...tableStats,
+                        htmlLength: cloneStats.htmlLength,
+                        captionLength: caption.length
+                    }
+                };
+                
+                Log.info(`✅ CONTENT EXTRACTION SUCCESSFUL:`);
+                Log.info(`  → HTML length: ${extractedContent.stats.htmlLength} characters`);
+                Log.info(`  → Caption: "${caption}"`);
+                Log.info(`  → Rows: ${extractedContent.stats.rows}`);
+                Log.info(`  → Cells: ${extractedContent.stats.cells}`);
+                Log.info(`  → Math elements: ${extractedContent.stats.mathElements}`);
+                Log.info(`  → Timestamp: ${extractedContent.timestamp}`);
+                
+                return extractedContent;
+                
+            } catch (error) {
+                Log.error(`❌ FAILED to extract popup content:`, error);
+                Log.error(`  → Error type: ${error.constructor.name}`);
+                Log.error(`  → Error message: ${error.message}`);
+                Log.error(`  → Stack trace: ${error.stack?.substring(0, 300) || 'not available'}`);
+                return null;
+            }
+        }
+
+        async _closeCurrentPopup() {
+            Log.info(`🔄 ATTEMPTING to close current popup...`);
+            
+            try {
+                // 分析当前弹窗状态
+                const popupState = {
+                    mfpContent: document.querySelectorAll('.mfp-content').length,
+                    visibleMfp: document.querySelectorAll('.mfp-content:not([style*="display: none"])').length,
+                    abstractTables: document.querySelectorAll('#abstract .html-table_show').length,
+                    mfpBg: document.querySelectorAll('.mfp-bg').length,
+                    anyPopup: document.querySelectorAll('[class*="popup"], [class*="modal"]').length
+                };
+                
+                Log.info(`📊 POPUP STATE BEFORE CLOSING:`);
+                Object.entries(popupState).forEach(([key, value]) => {
+                    Log.info(`  → ${key}: ${value}`);
+                });
+                
+                if (popupState.visibleMfp === 0 && popupState.abstractTables === 0) {
+                    Log.info(`ℹ️ No visible popups detected, skipping close attempt`);
+                    return;
+                }
+                
+                // 方法1：尝试寻找关闭按钮
+                const closeSelectors = [
+                    '.mfp-close',
+                    '[aria-label*="Close"]',
+                    '[title*="Close"]',
+                    '[data-action="close"]',
+                    '.popup-close',
+                    '.close-btn',
+                    'button[title*="Collapse"]'
+                ];
+                
+                Log.info(`🔍 METHOD 1: Searching for close buttons...`);
+                let closeAttempted = false;
+                
+                for (const selector of closeSelectors) {
+                    const closeBtns = document.querySelectorAll(selector);
+                    Log.info(`  → Selector "${selector}": ${closeBtns.length} elements found`);
+                    
+                    for (const closeBtn of closeBtns) {
+                        const isVisible = closeBtn.offsetParent !== null;
+                        const rect = closeBtn.getBoundingClientRect();
+                        const isInView = rect.width > 0 && rect.height > 0;
+                        
+                        Log.info(`    → Element: ${closeBtn.tagName}.${closeBtn.className || 'no-class'}`);
+                        Log.info(`    → Visible: ${isVisible}, In viewport: ${isInView}`);
+                        Log.info(`    → Text: "${closeBtn.textContent?.trim() || 'no-text'}"`);
+                        
+                        if (isVisible && isInView) {
+                            Log.info(`    ✅ CLICKING close button (${selector})`);
+                            closeBtn.click();
+                            closeAttempted = true;
+                            
+                            // 短暂延迟检查效果
+                            await U.delay(100);
+                            const newVisibleMfp = document.querySelectorAll('.mfp-content:not([style*="display: none"])').length;
+                            Log.info(`    → Result: visible popups ${popupState.visibleMfp} → ${newVisibleMfp}`);
+                            
+                            if (newVisibleMfp < popupState.visibleMfp) {
+                                Log.info(`✅ METHOD 1 SUCCESS: Popup closed with button`);
+                                return;
+                            }
+                        }
+                    }
+                }
+                
+                if (!closeAttempted) {
+                    Log.info(`⚠️ METHOD 1: No suitable close button found`);
+                }
+                
+                // 方法2：模拟ESC键
+                Log.info(`🔍 METHOD 2: Attempting ESC key...`);
+                const escEvent = new KeyboardEvent('keydown', {
+                    key: 'Escape',
+                    keyCode: 27,
+                    which: 27,
+                    bubbles: true,
+                    cancelable: true
+                });
+                
+                Log.info(`  → Dispatching ESC keydown event`);
+                document.dispatchEvent(escEvent);
+                
+                // 也尝试在document.body上触发
+                if (document.body) {
+                    document.body.dispatchEvent(escEvent);
+                }
+                
+                // 检查ESC键效果
+                await U.delay(150);
+                const afterEscMfp = document.querySelectorAll('.mfp-content:not([style*="display: none"])').length;
+                Log.info(`  → Result: visible popups ${popupState.visibleMfp} → ${afterEscMfp}`);
+                
+                if (afterEscMfp < popupState.visibleMfp) {
+                    Log.info(`✅ METHOD 2 SUCCESS: Popup closed with ESC key`);
+                    return;
+                }
+                
+                // 方法3：点击背景遮罩
+                Log.info(`🔍 METHOD 3: Attempting overlay click...`);
+                const overlaySelectors = ['.mfp-bg', '.popup-overlay', '.modal-overlay', '.backdrop'];
+                
+                for (const selector of overlaySelectors) {
+                    const overlays = document.querySelectorAll(selector);
+                    Log.info(`  → Selector "${selector}": ${overlays.length} overlays found`);
+                    
+                    for (const overlay of overlays) {
+                        const isVisible = overlay.offsetParent !== null;
+                        if (isVisible) {
+                            Log.info(`    ✅ CLICKING overlay (${selector})`);
+                            overlay.click();
+                            
+                            await U.delay(100);
+                            const afterOverlayMfp = document.querySelectorAll('.mfp-content:not([style*="display: none"])').length;
+                            Log.info(`    → Result: visible popups ${afterEscMfp} → ${afterOverlayMfp}`);
+                            
+                            if (afterOverlayMfp < afterEscMfp) {
+                                Log.info(`✅ METHOD 3 SUCCESS: Popup closed with overlay click`);
+                                return;
+                            }
+                        }
+                    }
+                }
+                
+                // 最终状态检查
+                const finalState = {
+                    mfpContent: document.querySelectorAll('.mfp-content').length,
+                    visibleMfp: document.querySelectorAll('.mfp-content:not([style*="display: none"])').length,
+                    abstractTables: document.querySelectorAll('#abstract .html-table_show').length
+                };
+                
+                Log.info(`📊 FINAL POPUP STATE:`);
+                Object.entries(finalState).forEach(([key, value]) => {
+                    Log.info(`  → ${key}: ${popupState[key] || 0} → ${value}`);
+                });
+                
+                if (finalState.visibleMfp === 0 && finalState.abstractTables === 0) {
+                    Log.info(`✅ POPUP CLEANUP SUCCESSFUL`);
+                } else {
+                    Log.warn(`⚠️ POPUP CLEANUP PARTIAL: Some elements may remain`);
+                }
+                
+            } catch (error) {
+                Log.error(`❌ FAILED to close popup:`, error);
+                Log.error(`  → Error type: ${error.constructor.name}`);
+                Log.error(`  → Error message: ${error.message}`);
+            }
+        }
+
+        _logDOMSnapshot(context = 'Unknown') {
+            Log.info(`📊 DOM SNAPSHOT - ${context.toUpperCase()}:`);
+            
+            try {
+                // 基础DOM统计
+                const basicStats = {
+                    totalElements: document.querySelectorAll('*').length,
+                    bodyExists: !!document.body,
+                    headExists: !!document.head,
+                    title: document.title || 'no-title'
+                };
+                
+                Log.info(`  🌐 BASIC DOM:`);
+                Object.entries(basicStats).forEach(([key, value]) => {
+                    Log.info(`    → ${key}: ${value}`);
+                });
+                
+                // 表格相关元素
+                const tableStats = {
+                    tableWraps: document.querySelectorAll('div.html-table-wrap').length,
+                    tables: document.querySelectorAll('table').length,
+                    popupLinks: document.querySelectorAll('.html-tablepopup').length,
+                    tableShows: document.querySelectorAll('.html-table_show').length,
+                    visibleTableShows: document.querySelectorAll('.html-table_show:not([style*="display: none"])').length
+                };
+                
+                Log.info(`  📋 TABLE ELEMENTS:`);
+                Object.entries(tableStats).forEach(([key, value]) => {
+                    Log.info(`    → ${key}: ${value}`);
+                });
+                
+                // 详细分析table-wrap元素
+                if (tableStats.tableWraps > 0) {
+                    Log.info(`  🔍 TABLE WRAP DETAILS:`);
+                    const wraps = document.querySelectorAll('div.html-table-wrap');
+                    wraps.forEach((wrap, i) => {
+                        const id = wrap.id || 'no-id';
+                        const hasPopupLink = !!wrap.querySelector('.html-tablepopup');
+                        const popupHref = wrap.querySelector('.html-tablepopup')?.getAttribute('href') || 'no-href';
+                        const isVisible = wrap.offsetParent !== null;
+                        
+                        Log.info(`    → Wrap ${i + 1}: id="${id}", hasPopup=${hasPopupLink}, href="${popupHref}", visible=${isVisible}`);
+                    });
+                }
+                
+                // 弹窗系统状态
+                const popupStats = {
+                    mfpContent: document.querySelectorAll('.mfp-content').length,
+                    visibleMfp: document.querySelectorAll('.mfp-content:not([style*="display: none"])').length,
+                    mfpBg: document.querySelectorAll('.mfp-bg').length,
+                    mfpClose: document.querySelectorAll('.mfp-close').length,
+                    abstractElement: !!document.querySelector('#abstract'),
+                    abstractTableShows: document.querySelectorAll('#abstract .html-table_show').length
+                };
+                
+                Log.info(`  🪟 POPUP SYSTEM:`);
+                Object.entries(popupStats).forEach(([key, value]) => {
+                    Log.info(`    → ${key}: ${value}`);
+                });
+                
+                // 详细分析弹窗内容
+                if (popupStats.mfpContent > 0) {
+                    Log.info(`  🔍 MFP CONTENT DETAILS:`);
+                    const mfpContents = document.querySelectorAll('.mfp-content');
+                    mfpContents.forEach((mfp, i) => {
+                        const isVisible = mfp.offsetParent !== null;
+                        const hasTable = !!mfp.querySelector('table');
+                        const tableCount = mfp.querySelectorAll('table').length;
+                        const hasTableShow = !!mfp.querySelector('.html-table_show');
+                        
+                        Log.info(`    → MFP ${i + 1}: visible=${isVisible}, tables=${tableCount}, hasTableShow=${hasTableShow}`);
+                    });
+                }
+                
+                // Abstract区域分析
+                if (popupStats.abstractElement) {
+                    Log.info(`  🔍 ABSTRACT AREA DETAILS:`);
+                    const abstract = document.querySelector('#abstract');
+                    const abstractStats = {
+                        children: abstract.children.length,
+                        tableShows: abstract.querySelectorAll('.html-table_show').length,
+                        tables: abstract.querySelectorAll('table').length,
+                        visible: abstract.offsetParent !== null
+                    };
+                    
+                    Object.entries(abstractStats).forEach(([key, value]) => {
+                        Log.info(`    → ${key}: ${value}`);
+                    });
+                    
+                    // 详细分析abstract中的表格显示元素
+                    const abstractTableShows = abstract.querySelectorAll('.html-table_show');
+                    if (abstractTableShows.length > 0) {
+                        abstractTableShows.forEach((show, i) => {
+                            const isVisible = show.offsetParent !== null;
+                            const hasTable = !!show.querySelector('table');
+                            const hasCaption = !!show.querySelector('.html-caption');
+                            const id = show.id || 'no-id';
+                            
+                            Log.info(`      → TableShow ${i + 1}: id="${id}", visible=${isVisible}, hasTable=${hasTable}, hasCaption=${hasCaption}`);
+                        });
+                    }
+                }
+                
+                // JavaScript事件和状态
+                const jsStats = {
+                    jqueryLoaded: typeof window.$ !== 'undefined',
+                    mathJaxLoaded: typeof window.MathJax !== 'undefined',
+                    magnific: typeof window.magnificPopup !== 'undefined'
+                };
+                
+                Log.info(`  ⚡ JAVASCRIPT STATE:`);
+                Object.entries(jsStats).forEach(([key, value]) => {
+                    Log.info(`    → ${key}: ${value}`);
+                });
+                
+                // 预提取表格状态
+                if (this._extractedTables) {
+                    Log.info(`  💾 PRE-EXTRACTED TABLES:`);
+                    Log.info(`    → Stored count: ${this._extractedTables.size}`);
+                    
+                    if (this._extractedTables.size > 0) {
+                        let index = 0;
+                        for (const [node, content] of this._extractedTables.entries()) {
+                            const nodeId = node.getAttribute?.('id') || 'no-id';
+                            const htmlLength = content.html?.length || 0;
+                            const caption = content.caption?.substring(0, 50) || 'no-caption';
+                            
+                            Log.info(`    → Entry ${index + 1}: node="${nodeId}", html=${htmlLength}chars, caption="${caption}..."`);
+                            index++;
+                        }
+                    }
+                }
+                
+            } catch (error) {
+                Log.error(`❌ Failed to generate DOM snapshot:`, error);
+            }
+        }
+
+        // —— 动态表格监听系统 ——
+        _setupDynamicTableCapture() {
+            const articleElement = document.querySelector('#abstract article.bright');
+            if (!articleElement) {
+                Log.info('❌ Article element not found for dynamic monitoring');
+                return;
+            }
+
+            Log.info('🔍 Setting up dynamic table capture for article element');
+            
+            this._dynamicObserver = new MutationObserver((mutations) => {
+                for (const mutation of mutations) {
+                    if (mutation.type === 'childList') {
+                        // 检测 mfp-wrap 元素的添加
+                        for (const addedNode of mutation.addedNodes) {
+                            if (addedNode.nodeType === Node.ELEMENT_NODE) {
+                                this._processDynamicTableNode(addedNode);
+                            }
+                        }
+                    }
+                }
+            });
+            
+            this._dynamicObserver.observe(articleElement, {
+                childList: true,
+                subtree: true
+            });
+        }
+
+        _processDynamicTableNode(node) {
+            // 检测是否为表格相关的动态内容（用户指定的class）
+            if (node.matches && node.matches('.mfp-wrap.mfp-close-btn-in.mfp-auto-cursor.mfp-ready')) {
+                Log.info(`🎯 Detected dynamic mfp-wrap content: ${node.className || 'no-class'}`);
+                
+                // 查找表格内容
+                const tables = node.querySelectorAll('table');
+                const tableShows = node.querySelectorAll('.html-table_show');
+                
+                Log.info(`  → Found ${tables.length} tables and ${tableShows.length} table-show containers`);
+                
+                for (const tableShow of tableShows) {
+                    this._captureDynamicTableFromShow(tableShow);
+                }
+            }
+        }
+
+        _captureDynamicTableFromShow(tableShowContainer) {
+            const table = tableShowContainer.querySelector('table');
+            if (!table) {
+                Log.info(`  ⚠️ No table found in table-show container`);
+                return;
+            }
+
+            // 提取表格内容和元数据
+            const captionEl = tableShowContainer.querySelector('.html-caption');
+            const caption = captionEl ? captionEl.textContent.trim() : '';
+            const tableHtml = table.outerHTML;
+            const containerId = tableShowContainer.id || 'no-id';
+            
+            // 生成唯一标识符
+            const tableId = this._generateDynamicTableId(containerId, caption);
+            
+            // 存储到动态内容集合
+            this._dynamicTables.set(tableId, {
+                html: tableHtml,
+                caption: caption,
+                containerId: containerId,
+                timestamp: Date.now(),
+                source: 'dynamic-mfp'
+            });
+            
+            Log.info(`✅ Captured dynamic table: ${tableId}`);
+            Log.info(`  → Caption: "${caption.substring(0, 50)}..."`);
+            Log.info(`  → HTML length: ${tableHtml.length} chars`);
+            Log.info(`  → Container ID: ${containerId}`);
+        }
+
+        _generateDynamicTableId(containerId, caption) {
+            // 使用容器ID作为主要标识符
+            if (containerId && containerId !== 'no-id') {
+                return `dynamic-${containerId}`;
+            }
+            
+            // 备用：使用caption的哈希
+            const captionHash = caption.substring(0, 20).replace(/\s+/g, '-').toLowerCase();
+            return `dynamic-${captionHash}-${Date.now()}`;
+        }
+
+        _stopDynamicTableCapture() {
+            if (this._dynamicObserver) {
+                this._dynamicObserver.disconnect();
+                this._dynamicObserver = null;
+                Log.info('🛑 Dynamic table monitoring stopped');
+            }
         }
     }
 
@@ -1757,6 +2722,9 @@
                 baseMarkdown: null,
                 lastPageHash: null
             };
+            
+            // 动态表格处理标志
+            this._dynamicTablesProcessed = false;
         }
 
         async runPipeline(mode = 'links') {
@@ -1793,6 +2761,12 @@
             this._prepareRun(mode);   // 每次运行先清空
             Log.info('Original Pipeline start:', mode);
 
+            // 0) Expand tables before processing (NEW)
+            if (this.adapter.expandTables) {
+                Log.info('Expanding MDPI popup tables...');
+                await this.adapter.expandTables();
+            }
+
             // 1) Meta / Bib / CiteMap
             const meta = this.adapter.getMeta();
             this._lastMeta = meta;
@@ -1822,9 +2796,32 @@
             }
             this.emitter.emitTOCPlaceholder();
 
+            // 处理动态捕获的表格内容（在所有sections之前输出一次）
+            if (this.adapter._dynamicTables && this.adapter._dynamicTables.size > 0 && !this._dynamicTablesProcessed) {
+                Log.info(`🎯 PROCESSING ${this.adapter._dynamicTables.size} DYNAMIC TABLES`);
+                
+                for (const [tableId, tableData] of this.adapter._dynamicTables.entries()) {
+                    Log.info(`📝 Emitting dynamic table: ${tableId}`);
+                    Log.info(`  → Caption: "${tableData.caption.substring(0, 50)}..."`);
+                    Log.info(`  → HTML length: ${tableData.html.length} chars`);
+                    Log.info(`  → Source: ${tableData.source}`);
+                    
+                    // 输出表格到markdown
+                    this.emitter.emitTable({ html: tableData.html });
+                }
+                
+                this._dynamicTablesProcessed = true;
+                Log.info(`✅ All dynamic tables processed - total: ${this.adapter._dynamicTables.size}`);
+            }
+
             // 3) 主体渲染
             for (const sec of sections) {
                 this.emitter.emitHeading(sec.level || 2, sec.title || 'Section', sec.anchor);
+
+                // Log pre-extracted table status for this section
+                if (this.adapter._extractedTables && this.adapter._extractedTables.size > 0) {
+                    Log.info(`📊 PRE-EXTRACTED TABLES STATUS for section "${sec.title}": ${this.adapter._extractedTables.size} tables available`);
+                }
 
                 for (const node of (sec.nodes || [])) {
                     // —— 优先尝试"站点无关"的块级公式抽取 —— //
@@ -1837,10 +2834,10 @@
 
                     // —— 优先：算法表格（即使节点不是 table，本函数也能向下查询）—— //
                     if (this.adapter.isAlgorithmTable && this.adapter.isAlgorithmTable(node)) {
-                        Log.info(`Processing algorithm table in Controller, node tag: ${node.tagName}`);
+                        // Log.info(`Processing algorithm table in Controller, node tag: ${node.tagName}`);
                         const t = this.adapter.extractAlgorithmTable(node);
-                        Log.info(`Algorithm table extracted - HTML length: ${t.html ? t.html.length : 0}`);
-                        Log.info(`Algorithm table HTML preview: ${t.html ? t.html.substring(0, 200) : 'empty'}...`);
+                        // Log.info(`Algorithm table extracted - HTML length: ${t.html ? t.html.length : 0}`);
+                        // Log.info(`Algorithm table HTML preview: ${t.html ? t.html.substring(0, 200) : 'empty'}...`);
                         this.emitter.emitTable({ html: t.html });
                         continue;
                     }
@@ -1862,6 +2859,19 @@
                     }
 
                     // —— 表：一般表格 —— //
+                    const nodeInfo = `${tag}.${node.className || 'no-class'}#${node.getAttribute?.('id') || 'no-id'}`;
+                    
+                    const hasMatches = !!(node.matches);
+                    const isTableContainer = hasMatches && this.adapter.isTableContainer && this.adapter.isTableContainer(node);
+                    const isTableLikeFigure = hasMatches && this.adapter.isTableLikeFigure && this.adapter.isTableLikeFigure(node);
+                    const isDirectTable = tag === 'table';
+                    
+                    Log.info(`🔍 TABLE CHECK for ${nodeInfo}:`);
+                    Log.info(`  → hasMatches: ${hasMatches}`);
+                    Log.info(`  → isTableContainer: ${isTableContainer}`);
+                    Log.info(`  → isTableLikeFigure: ${isTableLikeFigure}`);
+                    Log.info(`  → isDirectTable: ${isDirectTable}`);
+                    
                     if (
                         (node.matches && (
                             (this.adapter.isTableContainer && this.adapter.isTableContainer(node)) ||
@@ -1869,11 +2879,13 @@
                         )) ||
                         tag === 'table'
                     ) {
-                        Log.info(`Processing general table in Controller - tag: ${tag}, className: ${node.className || 'no-class'}`);
+                        Log.info(`✅ PROCESSING TABLE: ${nodeInfo}`);
                         const t = await this.adapter.extractTable(node);
-                        Log.info(`General table extracted - HTML length: ${t.html ? t.html.length : 0}`);
+                        Log.info(`📊 Table extracted - HTML length: ${t?.html ? t.html.length : 0}, has content: ${!!t}`);
                         this.emitter.emitTable(t);
                         continue;
+                    } else {
+                        Log.info(`❌ SKIPPING element ${nodeInfo} - not recognized as table`);
                     }
 
                     // —— 图：纯图片 figure（非表样式）—— //
@@ -2014,6 +3026,7 @@
             // 3) 清空本次运行的状态寄存
             this._cited = new Set();
             this._lastMeta = null;
+            this._dynamicTablesProcessed = false; // 重置动态表格处理标志
 
             // 4)（可选）确保导出器仍绑定当前资产管理器
             if (this.exporter && typeof this.exporter.bindAssets === 'function') {
@@ -2041,6 +3054,12 @@
          */
         async _buildBaseCacheWithOriginalLogic() {
             Log.info('Building base cache data with original logic...');
+            
+            // Expand tables before processing (NEW)
+            if (this.adapter.expandTables) {
+                Log.info('Expanding MDPI popup tables for cache...');
+                await this.adapter.expandTables();
+            }
             
             // 提取基础数据
             const meta = this.adapter.getMeta();
