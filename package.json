@@ -4,7 +4,7 @@
   "description": "Neils's collection of tempermonkey scripts",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --test"
   },
   "repository": {
     "type": "git",
@@ -15,5 +15,8 @@
   "bugs": {
     "url": "https://github.com/nerdneilsfield/neils-monkey-scripts/issues"
   },
-  "homepage": "https://github.com/nerdneilsfield/neils-monkey-scripts#readme"
+  "homepage": "https://github.com/nerdneilsfield/neils-monkey-scripts#readme",
+  "devDependencies": {
+    "jsdom": "^29.0.1"
+  }
 }
