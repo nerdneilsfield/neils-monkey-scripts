@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         知乎问题回答批量/选择性导出为 Markdown
 // @namespace    http://tampermonkey.net/
-// @version      0.8.2
+// @version      0.9.0
 // @description  在知乎问题页提供下载全部回答或选择部分回答导出为 Markdown 的功能
 // @author       Qi Deng
 // @match        https://www.zhihu.com/question/*
@@ -14,8 +14,19 @@
 (function () {
     'use strict';
 
-    const DEFAULT_COMMENT_FETCH_TIMEOUT = 8000;
-    const RETRY_SCROLL_BOTTOM_TIMES = 15;
+    const ANSWER_LOAD_WAIT_TIMEOUT = 1800;
+    const COMMENT_PANEL_WAIT_TIMEOUT = 1200;
+    const COMMENT_OPEN_WAIT_TIMEOUT = 600;
+    const WAIT_POLL_INTERVAL = 120;
+    const STABLE_POLL_LIMIT = 3;
+    const RETRY_SCROLL_BOTTOM_TIMES = 6;
+    const MAX_NESTED_REPLY_THREADS_PER_ANSWER = 80;
+    const STOP_ERROR_MESSAGE = '__ZUD_STOP__';
+    const __zudRunState = {
+        requested: false,
+        running: false,
+        label: ''
+    };
 
     // --- Turndown Configuration ---
     const turndownService = new TurndownService({
@@ -67,7 +78,11 @@
 #zudPanel .zud-actions{display:flex; gap:6px;}
 #zudPanel .zud-toggle, #zudPanel .zud-clear{padding:5px 10px; border-radius:8px; border:1px solid #d0d7de;
   background:#ffffff; color:#565a76; cursor:pointer; font-size:12px; transition:all 0.2s;}
+#zudPanel .zud-stop{padding:5px 10px; border-radius:8px; border:1px solid #d0d7de;
+  background:#fff5f5; color:#b42318; cursor:pointer; font-size:12px; transition:all 0.2s;}
 #zudPanel .zud-toggle:hover, #zudPanel .zud-clear:hover{background:#f3f4f6; border-color:#8c96a8;}
+#zudPanel .zud-stop:hover:not(:disabled){background:#ffe4e4; border-color:#f04438;}
+#zudPanel .zud-stop:disabled{opacity:0.5; cursor:not-allowed;}
 #zudPanel .zud-body{display:block;}
 #zud-btns{display:grid; grid-template-columns:1fr; gap:8px; margin-bottom:12px;}
 .zud-btn{padding:9px 14px; border-radius:10px; border:1px solid; color:#fff; font-weight:500;
@@ -89,7 +104,12 @@
 #zud-topn .grid .zud-btn:last-child{grid-column:1/3;}
 #zud-topn #zudHint{color:#8b92a8; font-size:12px; margin-left:8px;}
 #zud-logwrap{border-top:1px solid #e5e9f0; padding-top:10px; margin-top:10px;}
-#zud-logwrap .log-title{color:#565a76; font-weight:500; margin-bottom:6px; font-size:12px;}
+#zud-logwrap .log-head{display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:6px;}
+#zud-logwrap .log-title{color:#565a76; font-weight:500; font-size:12px;}
+#zud-logwrap .log-actions{display:flex; gap:6px;}
+#zudPanel .zud-logbtn{padding:4px 8px; border-radius:8px; border:1px solid #d0d7de;
+  background:#ffffff; color:#565a76; cursor:pointer; font-size:11px; transition:all 0.2s;}
+#zudPanel .zud-logbtn:hover{background:#f3f4f6; border-color:#8c96a8;}
 #zud-log{max-height:120px; overflow:auto; background:#f6f8fa; border:1px solid #d0d7de;
   border-radius:8px; padding:8px; font-family:'SF Mono',Monaco,Consolas,monospace; font-size:11px; line-height:1.4;}
 #zud-log::-webkit-scrollbar{width:6px;}
@@ -119,6 +139,7 @@
               <div class="zud-header">
                 <div>Markdown 导出工具</div>
                 <div class="zud-actions">
+                  <button class="zud-stop" id="zudStop" disabled>停止</button>
                   <button class="zud-toggle" id="zudToggle">折叠</button>
                   <button class="zud-clear" id="zudClear">清空</button>
                 </div>
@@ -141,7 +162,13 @@
                   </div>
                 </div>
                 <div id="zud-logwrap">
-                  <div class="log-title">运行日志</div>
+                  <div class="log-head">
+                    <div class="log-title">运行日志</div>
+                    <div class="log-actions">
+                      <button id="zudCopyLog" class="zud-logbtn">拷贝</button>
+                      <button id="zudExportLog" class="zud-logbtn">导出</button>
+                    </div>
+                  </div>
                   <div id="zud-log"></div>
                 </div>
               </div>
@@ -163,6 +190,32 @@
             panel.querySelector('#zudClear').addEventListener('click', () => {
                 const el = document.getElementById('zud-log');
                 if (el) el.innerHTML = '';
+            });
+
+            panel.querySelector('#zudStop').addEventListener('click', () => {
+                __requestStop();
+            });
+
+            panel.querySelector('#zudCopyLog').addEventListener('click', async () => {
+                const text = __getLogText();
+                try {
+                    if (navigator.clipboard?.writeText) {
+                        await navigator.clipboard.writeText(text);
+                        __trace('log', 'copied', { lines: text ? text.split('\n').length : 0 });
+                    } else {
+                        throw new Error('clipboard-unavailable');
+                    }
+                } catch (error) {
+                    console.warn('Failed to copy logs:', error);
+                }
+            });
+
+            panel.querySelector('#zudExportLog').addEventListener('click', () => {
+                const text = __getLogText();
+                const title = document.querySelector('.QuestionHeader-title')?.innerText || '知乎日志';
+                const filename = `${sanitizeFilename(title)}_${formatDownloadDateTime()}.log`;
+                __downloadTextFile(filename, text, 'text/plain;charset=utf-8');
+                __trace('log', 'exported', { filename });
             });
 
             // Get actual answer count and set slider max
@@ -187,14 +240,30 @@
 
             // Button actions
             const setBusy = (flag) => {
-                panel.querySelectorAll('button, input').forEach(el => el.disabled = flag);
+                panel.querySelectorAll('button, input').forEach(el => {
+                    if (el.id === 'zudStop') {
+                        el.disabled = !flag;
+                    } else {
+                        el.disabled = flag;
+                    }
+                });
+                __updateStopButton();
             };
 
             panel.querySelector('#zudLoadN').addEventListener('click', async () => {
                 const n = parseInt(input.value, 10) || 50;
+                __beginOperation(`load-n:${n}`);
                 setBusy(true);
                 try {
                     await loadAtLeastNAnswers(n);
+                    __endOperation('done');
+                } catch (error) {
+                    if (__isStopError(error)) {
+                        __endOperation('stopped');
+                    } else {
+                        __endOperation('error');
+                        throw error;
+                    }
                 } finally {
                     setBusy(false);
                 }
@@ -202,6 +271,7 @@
 
             panel.querySelector('#zudTopN').addEventListener('click', async () => {
                 const n = parseInt(input.value, 10) || 50;
+                __beginOperation(`top-n:${n}`);
                 setBusy(true);
                 try {
                     await loadAtLeastNAnswers(n);
@@ -211,6 +281,14 @@
                     const title = document.querySelector('.QuestionHeader-title')?.innerText || '知乎问题';
                     const filename = `${sanitizeFilename(title)}_${formatDownloadDateTime()}_top${n}.md`;
                     downloadMarkdownFile(filename, fullMd);
+                    __endOperation('done');
+                } catch (error) {
+                    if (__isStopError(error)) {
+                        __endOperation('stopped');
+                    } else {
+                        __endOperation('error');
+                        throw error;
+                    }
                 } finally {
                     setBusy(false);
                 }
@@ -218,6 +296,7 @@
 
             panel.querySelector('#zudTopNC').addEventListener('click', async () => {
                 const n = parseInt(input.value, 10) || 30;
+                __beginOperation(`top-n-comments:${n}`);
                 setBusy(true);
                 try {
                     await loadAtLeastNAnswers(n);
@@ -227,6 +306,14 @@
                     const title = document.querySelector('.QuestionHeader-title')?.innerText || '知乎问题';
                     const filename = `${sanitizeFilename(title)}_${formatDownloadDateTime()}_top${n}_with_comments.md`;
                     downloadMarkdownFile(filename, fullMd);
+                    __endOperation('done');
+                } catch (error) {
+                    if (__isStopError(error)) {
+                        __endOperation('stopped');
+                    } else {
+                        __endOperation('error');
+                        throw error;
+                    }
                 } finally {
                     setBusy(false);
                 }
@@ -274,6 +361,68 @@
         return m ? m[0].replace(/,/g, '') : '0';
     }
 
+    function __formatTraceMessage(scope, stage, details = {}) {
+        const suffix = Object.entries(details)
+            .filter(([, value]) => value !== undefined && value !== null && value !== '')
+            .map(([key, value]) => `${key}=${value}`)
+            .join(' ');
+        return suffix ? `[${scope}] ${stage} ${suffix}` : `[${scope}] ${stage}`;
+    }
+
+    function __trace(scope, stage, details = {}) {
+        console.log(__formatTraceMessage(scope, stage, details));
+    }
+
+    function __createStopError() {
+        const error = new Error(STOP_ERROR_MESSAGE);
+        error.name = 'ZudStopError';
+        return error;
+    }
+
+    function __isStopError(error) {
+        return error?.name === 'ZudStopError' || error?.message === STOP_ERROR_MESSAGE;
+    }
+
+    function __updateStopButton() {
+        const button = document.getElementById('zudStop');
+        if (!button) return;
+        button.disabled = !__zudRunState.running;
+        button.textContent = __zudRunState.requested ? '停止中...' : '停止';
+    }
+
+    function __beginOperation(label) {
+        __zudRunState.requested = false;
+        __zudRunState.running = true;
+        __zudRunState.label = label;
+        __trace('control', 'operation-start', { label });
+        __updateStopButton();
+    }
+
+    function __endOperation(status = 'done') {
+        __trace('control', 'operation-end', { label: __zudRunState.label, status });
+        __zudRunState.requested = false;
+        __zudRunState.running = false;
+        __zudRunState.label = '';
+        __updateStopButton();
+    }
+
+    function __requestStop() {
+        __zudRunState.requested = true;
+        __trace('control', 'stop-requested', { label: __zudRunState.label || 'manual' });
+        __updateStopButton();
+    }
+
+    function __resetStopRequest() {
+        __zudRunState.requested = false;
+        __updateStopButton();
+    }
+
+    function __throwIfStopRequested(scope = 'control', stage = 'cancelled') {
+        if (!__zudRunState.requested) return;
+        __trace(scope, stage, { label: __zudRunState.label });
+        throw __createStopError();
+    }
+
 
     function __getUpvoteCountFromAnswer(answerEl) {
         const voteBtn = answerEl.querySelector('button[aria-label*="赞同"], .VoteButton, .VoteButton--up');
@@ -281,10 +430,59 @@
         return __parseZhihuCount(raw);
     }
 
+    function __getCommentButtonText(button) {
+        return (button?.getAttribute('aria-label') || button?.textContent || '').replace(/\s+/g, ' ').trim();
+    }
+
+    function __looksLikeCommentButton(button) {
+        if (!button) return false;
+        const raw = __getCommentButtonText(button);
+        if (button.querySelector('.Zi--Comment, [class*="Comment"]')) return true;
+        return /评论/.test(raw);
+    }
+
+    function __getCommentActionButton(answerEl) {
+        if (!answerEl) return null;
+        const scopedButtons = answerEl.querySelectorAll('.ContentItem-actions button, .ContentItem-action button, button');
+        for (const button of scopedButtons) {
+            if (__looksLikeCommentButton(button)) return button;
+        }
+        return null;
+    }
+
     function __getCommentCountFromAnswer(answerEl) {
-        const cbtn = answerEl.querySelector('.ContentItem-action .Zi--Comment')?.closest('button');
-        const raw = cbtn?.textContent || '';
+        const cbtn = __getCommentActionButton(answerEl);
+        const raw = __getCommentButtonText(cbtn);
         return __parseZhihuCount(raw);
+    }
+
+    function __getAnswerTimeFromAnswer(answerEl) {
+        const timeElement = answerEl.querySelector('time');
+        if (timeElement) {
+            const publishTime = (timeElement.getAttribute('data-tooltip') || '').replace('发布于 ', '').trim();
+            const editText = (timeElement.innerText || timeElement.textContent || '').trim();
+            if (editText.includes('编辑于') && publishTime) {
+                return `发布: ${publishTime} | ${editText}`;
+            }
+            return publishTime || editText || '未知时间';
+        }
+
+        const fallbackSelectors = [
+            '.ContentItem-time a',
+            '.ContentItem-time span',
+            '.ContentItem-time',
+            '[class*="ContentItem-time"] a',
+            '[class*="ContentItem-time"] span',
+            '[class*="ContentItem-time"]'
+        ];
+
+        for (const selector of fallbackSelectors) {
+            const el = answerEl.querySelector(selector);
+            const text = (el?.getAttribute('data-tooltip') || el?.textContent || '').replace(/\s+/g, ' ').trim();
+            if (text) return text.replace('发布于 ', '');
+        }
+
+        return '未知时间';
     }
 
     function __getAnswerId(answerEl) {
@@ -316,55 +514,13 @@
     }
 
     async function humanLikeScrollToBottom() {
-        const startY = window.scrollY;
-        const targetY = document.body.scrollHeight;
-        const totalDistance = targetY - startY;
-
-        let currentY = startY;
-        const steps = 8 + Math.floor(Math.random() * 5); // 8-12步
-
-        for (let i = 0; i < steps; i++) {
-            // 计算每步的滑动距离（带随机性）
-            const baseStep = totalDistance / steps;
-            const randomVariation = (Math.random() - 0.5) * 0.3; // ±15%变化
-            const stepSize = baseStep * (1 + randomVariation);
-
-            currentY += stepSize;
-
-            // 偶尔回退一点（10%概率）
-            if (Math.random() < 0.1 && i > 2) {
-                const backtrack = stepSize * (0.1 + Math.random() * 0.2); // 回退10-30%
-                currentY -= backtrack;
-                await smoothScrollTo(currentY, 150 + Math.random() * 100);
-                await new Promise(r => setTimeout(r, 100 + Math.random() * 200));
-                currentY += backtrack; // 再滑回去
-            }
-
-            // 滑动到当前位置
-            await smoothScrollTo(currentY, 200 + Math.random() * 200);
-
-            // 随机停顿
-            const pauseTime = 50 + Math.random() * 150;
-            await new Promise(r => setTimeout(r, pauseTime));
-        }
-
-        // 最后确保到底部
-        await smoothScrollTo(document.body.scrollHeight + 100, 300);
-
-        await new Promise(r => setTimeout(r, 100 + Math.random() * 200));
-
-        // 稍微往上滑一点
-        await smoothScrollTo(document.body.scrollHeight - 350, 500);
-
-        await new Promise(r => setTimeout(r, 2000 + Math.random() * 200));
-
-        // 再滑到底部
-        await smoothScrollTo(document.body.scrollHeight + 100, 300);
-
-        // 稍微往上滑一点
-        await smoothScrollTo(document.body.scrollHeight - 100, 300);
-
-        await new Promise(r => setTimeout(r, 500 + Math.random() * 200));
+        const targetBottom = document.body.scrollHeight;
+        await smoothScrollTo(targetBottom + 80, 220);
+        await __sleep(80);
+        await smoothScrollTo(Math.max(0, document.body.scrollHeight - 240), 180);
+        await __sleep(120);
+        await smoothScrollTo(document.body.scrollHeight + 80, 180);
+        await __sleep(80);
     }
 
     function smoothScrollTo(targetY, duration = 300) {
@@ -397,37 +553,13 @@
     }
 
     async function humanLikeScrollContainerToBottom(container) {
-        const startY = container.scrollTop;
         const maxScrollY = container.scrollHeight - container.clientHeight;
-        const totalDistance = maxScrollY - startY;
-
-        if (totalDistance <= 0) return;
-
-        let currentY = startY;
-        const steps = 6 + Math.floor(Math.random() * 4); // 6-9步
-
-        for (let i = 0; i < steps; i++) {
-            const baseStep = totalDistance / steps;
-            const randomVariation = (Math.random() - 0.5) * 0.4; // ±20%变化
-            const stepSize = baseStep * (1 + randomVariation);
-
-            currentY += stepSize;
-
-            // 偶尔回退（15%概率）
-            if (Math.random() < 0.15 && i > 1) {
-                const backtrack = stepSize * (0.15 + Math.random() * 0.25);
-                currentY -= backtrack;
-                await smoothScrollContainer(container, currentY, 120 + Math.random() * 80);
-                await new Promise(r => setTimeout(r, 80 + Math.random() * 120));
-                currentY += backtrack;
-            }
-
-            await smoothScrollContainer(container, currentY, 150 + Math.random() * 150);
-            await new Promise(r => setTimeout(r, 30 + Math.random() * 100));
-        }
-
-        // 确保到底部
-        await smoothScrollContainer(container, maxScrollY, 200);
+        if (maxScrollY <= container.scrollTop) return;
+        await smoothScrollContainer(container, maxScrollY, 180);
+        await __sleep(80);
+        await smoothScrollContainer(container, Math.max(0, maxScrollY - 140), 120);
+        await __sleep(80);
+        await smoothScrollContainer(container, maxScrollY, 120);
     }
 
     function smoothScrollContainer(container, targetY, duration = 200) {
@@ -465,6 +597,47 @@
         }
     }
 
+    function __sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    async function __waitForGrowth(getValue, options = {}) {
+        const {
+            timeoutMs = ANSWER_LOAD_WAIT_TIMEOUT,
+            intervalMs = WAIT_POLL_INTERVAL,
+            stablePollLimit = STABLE_POLL_LIMIT
+        } = options;
+
+        let baseline = Number(getValue()) || 0;
+        let stablePolls = 0;
+        const startedAt = Date.now();
+
+        while (Date.now() - startedAt < timeoutMs) {
+            if (__zudRunState.requested) {
+                return { changed: false, value: Number(getValue()) || 0, cancelled: true };
+            }
+            await __sleep(intervalMs);
+
+            const nextValue = Number(getValue()) || 0;
+            if (nextValue > baseline) {
+                return { changed: true, value: nextValue, cancelled: false };
+            }
+
+            if (nextValue === baseline) {
+                stablePolls++;
+                if (stablePolls >= stablePollLimit) {
+                    return { changed: false, value: nextValue, cancelled: false };
+                }
+                continue;
+            }
+
+            baseline = nextValue;
+            stablePolls = 0;
+        }
+
+        return { changed: false, value: Number(getValue()) || 0, cancelled: false };
+    }
+
     async function processAnswersWithComments(answers, concurrency = 2) {
         const results = [];
         for (let i = 0; i < answers.length; i += concurrency) {
@@ -474,9 +647,55 @@
             );
             results.push(...batchResults);
             closeCommentModal(); // 每批次后关闭可能的弹窗
-            await new Promise(r => setTimeout(r, 500));
+            await __sleep(500);
         }
         return results;
+    }
+
+    async function __nudgeAnswerLoading() {
+        const answers = document.querySelectorAll('.AnswerItem');
+        const last = answers[answers.length - 1];
+        const listContainer = document.getElementById('QuestionAnswers-answers');
+
+        if (last?.scrollIntoView) {
+            last.scrollIntoView({ block: 'end' });
+        }
+
+        await humanLikeScrollToBottom();
+        window.scrollBy(0, Math.max(200, Math.floor(window.innerHeight * 0.9)));
+
+        if (listContainer) {
+            try {
+                listContainer.scrollTop = listContainer.scrollHeight;
+            } catch (_) { }
+        }
+
+        const moreBtns = [
+            'button.ContentItem-more',
+            '.QuestionAnswers-answerList .PaginationButton',
+            '.PaginationButton',
+            'button:has(.Zi--ArrowDown)',
+            'button:has(.Zi--ChevronDown)'
+        ];
+
+        for (const sel of moreBtns) {
+            const buttons = document.querySelectorAll(sel);
+            for (const btn of buttons) {
+                if (btn && btn.offsetParent !== null) {
+                    try { btn.click(); } catch (_) { }
+                }
+            }
+        }
+
+        const expandButtons = document.querySelectorAll('button.ContentItem-expandButton, .ContentItem-rightButton.ContentItem-expandButton');
+        for (const button of expandButtons) {
+            const text = (button.textContent || '').replace(/\s+/g, ' ').trim();
+            if (button.offsetParent !== null && /阅读全文/.test(text)) {
+                try { button.click(); } catch (_) { }
+            }
+        }
+
+        await __sleep(120);
     }
 
     function formatDownloadDateTime() {
@@ -497,8 +716,8 @@
         return sanitized;
     }
 
-    function downloadMarkdownFile(filename, content) {
-        const blob = new Blob([content], { type: 'text/markdown;charset=utf-8' });
+    function __downloadTextFile(filename, content, mimeType) {
+        const blob = new Blob([content], { type: mimeType });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
@@ -507,6 +726,97 @@
         a.click();
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
+    }
+
+    function downloadMarkdownFile(filename, content) {
+        __downloadTextFile(filename, content, 'text/markdown;charset=utf-8');
+    }
+
+    function __getLogText() {
+        const el = document.getElementById('zud-log');
+        if (!el) return '';
+        return Array.from(el.children)
+            .map(node => (node.textContent || '').trim())
+            .filter(Boolean)
+            .join('\n');
+    }
+
+    function __escapeTableCell(value) {
+        return String(value ?? '').replace(/\|/g, '\\|').replace(/\n+/g, ' ').trim();
+    }
+
+    function __renderMarkdownTable(rows) {
+        let md = `| 字段 | 内容 |\n|---|---|\n`;
+        for (const [label, value] of rows) {
+            md += `| ${__escapeTableCell(label)} | ${__escapeTableCell(value)} |\n`;
+        }
+        return md;
+    }
+
+    function __renderMetricsTable(rows) {
+        let md = `| 指标 | 数值 |\n|---|---|\n`;
+        for (const [label, value] of rows) {
+            md += `| ${__escapeTableCell(label)} | ${__escapeTableCell(value)} |\n`;
+        }
+        return md;
+    }
+
+    function __renderQuestionMarkdown({
+        title,
+        url,
+        author,
+        topics,
+        followerCount,
+        viewCount,
+        answerCount,
+        descriptionMd
+    }) {
+        const rows = [
+            ['URL', url],
+            ['提问者', author || '匿名用户'],
+            ['话题', (topics && topics.length > 0) ? topics.join(' / ') : '无'],
+            ['关注 / 浏览 / 回答', `${followerCount} / ${viewCount} / ${answerCount}`]
+        ];
+
+        let md = `# ${title}\n\n`;
+        md += __renderMarkdownTable(rows) + '\n';
+        md += `## 问题描述\n\n`;
+        md += (descriptionMd && descriptionMd.trim()) ? `${descriptionMd.trim()}\n\n` : '无\n\n';
+        md += `---\n\n`;
+        return md;
+    }
+
+    function __renderAnswerMarkdown({
+        index,
+        authorName,
+        authorUrl,
+        upvoteCount,
+        commentCount,
+        time,
+        contentMd,
+        commentsMd = ''
+    }) {
+        let md = `## 回答 ${index} | ${authorName}\n\n`;
+        if (authorUrl && authorUrl !== '#') {
+            md += `[作者主页](${authorUrl})\n\n`;
+        }
+        md += __renderMetricsTable([
+            ['赞同', upvoteCount],
+            ['评论', commentCount],
+            ['时间', time]
+        ]) + '\n';
+        md += `### 正文\n\n`;
+        md += `${(contentMd || '').trim() || '无'}\n\n`;
+
+        const normalizedCommentsMd = commentsMd
+            ? commentsMd.replace(/^#### 评论/m, '### 评论').trim()
+            : '';
+        if (normalizedCommentsMd) {
+            md += `${normalizedCommentsMd}\n\n`;
+        }
+
+        md += `---\n\n`;
+        return md;
     }
 
     function getQuestionInfo() {
@@ -521,24 +831,16 @@
         const followerCount = document.querySelector('.QuestionFollowStatus .NumberBoard-item:nth-child(1) .NumberBoard-itemValue')?.getAttribute('title') || 'N/A';
         const viewCount = document.querySelector('.QuestionFollowStatus .NumberBoard-item:nth-child(2) .NumberBoard-itemValue')?.getAttribute('title') || 'N/A';
         const answerCount = document.querySelector('.List-headerText span')?.innerText.match(/\d+/)?.[0] || 'N/A';
-
-        let md = `# ${title}\n\n`;
-        md += `**URL:** ${url}\n\n`;
-        if (author !== 'Anonymous') {
-            md += `**提问者:** ${author}\n\n`;
-        }
-        if (topics.length > 0) {
-            md += `**话题:** ${topics.join(', ')}\n\n`;
-        }
-        md += `**关注者:** ${followerCount} | **被浏览:** ${viewCount} | **回答数:** ${answerCount}\n\n`;
-        if (descriptionMd.trim()) {
-            md += `## 问题描述\n\n`;
-            md += descriptionMd + '\n\n';
-        } else {
-            md += `## 问题描述\n\n无\n\n`;
-        }
-        md += `--- \n\n`;
-        return md;
+        return __renderQuestionMarkdown({
+            title,
+            url,
+            author: author !== 'Anonymous' ? author : '匿名用户',
+            topics,
+            followerCount,
+            viewCount,
+            answerCount,
+            descriptionMd
+        });
     }
 
     // Load at least N answers
@@ -549,6 +851,7 @@
         const maxAttempts = 200;
 
         for (let attempt = 0; attempt < maxAttempts; attempt++) {
+            __throwIfStopRequested('answers', 'stop-during-load');
             const answers = document.querySelectorAll('.AnswerItem');
             const currentCount = answers.length;
 
@@ -559,13 +862,16 @@
                 break;
             }
 
-            // Scroll to bottom to trigger lazy loading
-            await humanLikeScrollToBottom();
+            // Trigger lazy loading / pagination controls
+            await __nudgeAnswerLoading();
 
             // Wait for new content to load
-            await new Promise(r => setTimeout(r, DEFAULT_COMMENT_FETCH_TIMEOUT));
-
-            const newCount = document.querySelectorAll('.AnswerItem').length;
+            const growthResult = await __waitForGrowth(
+                () => document.querySelectorAll('.AnswerItem').length,
+                { timeoutMs: ANSWER_LOAD_WAIT_TIMEOUT }
+            );
+            if (growthResult.cancelled) throw __createStopError();
+            const newCount = growthResult.value;
             if (newCount === lastCount) {
                 stagnant++;
                 if (stagnant >= RETRY_SCROLL_BOTTOM_TIMES) {
@@ -581,7 +887,7 @@
 
         // Scroll back to top
         window.scrollTo(0, 0);
-        await new Promise(r => setTimeout(r, 500));
+        await __sleep(200);
     }
 
     // Get top N answers
@@ -596,27 +902,19 @@
             const authorUrl = authorEl?.href || '#';
             const upvoteCount = __getUpvoteCountFromAnswer(answerEl);
             const commentCount = __getCommentCountFromAnswer(answerEl);
-            const timeElement = answerEl.querySelector('time');
-            let time = '未知时间';
-            if (timeElement) {
-                const publishTime = timeElement.getAttribute('data-tooltip')?.replace('发布于 ', '') || '';
-                const editText = timeElement.innerText || '';
-                if (editText.includes('编辑于')) {
-                    time = `发布: ${publishTime} | ${editText}`;
-                } else {
-                    time = publishTime || editText || '未知时间';
-                }
-            }
+            const time = __getAnswerTimeFromAnswer(answerEl);
             const contentHtml = answerEl.querySelector('.RichText.ztext')?.innerHTML || '';
             const contentMd = turndownService.turndown(contentHtml);
 
-            md += `### ${i + 1}. ${authorName}\n\n`;
-            if (authorUrl && authorUrl !== '#') {
-                md += `[${authorName}](${authorUrl})\n\n`;
-            }
-            md += `**赞同:** ${upvoteCount} | **评论:** ${commentCount} | **时间:** ${time}\n\n`;
-            md += contentMd + '\n\n';
-            md += `--- \n\n`;
+            md += __renderAnswerMarkdown({
+                index: i + 1,
+                authorName,
+                authorUrl,
+                upvoteCount,
+                commentCount,
+                time,
+                contentMd
+            });
 
             await yieldToBrowser(0);
         }
@@ -636,26 +934,29 @@
             const authorUrl = authorEl?.href || '#';
             const upvoteCount = __getUpvoteCountFromAnswer(answerEl);
             const commentCount = __getCommentCountFromAnswer(answerEl);
-            const timeElement = answerEl.querySelector('time');
-            const time = timeElement ? (timeElement.getAttribute('data-tooltip') || timeElement.innerText || '').replace('发布于 ', '').replace('编辑于 ', '编辑于 ') : '未知时间';
+            const time = __getAnswerTimeFromAnswer(answerEl);
             const contentHtml = answerEl.querySelector('.RichText.ztext')?.innerHTML || '';
             const contentMd = turndownService.turndown(contentHtml);
 
-            md += `### ${i + 1}. ${authorName}\n\n`;
-            if (authorUrl && authorUrl !== '#') {
-                md += `[${authorName}](${authorUrl})\n\n`;
-            }
-            md += `**赞同:** ${upvoteCount} | **评论:** ${commentCount} | **时间:** ${time}\n\n`;
-            md += contentMd + '\n\n';
-
             const answerId = __getAnswerId(answerEl);
+            let commentsMd = '';
             if (answerId) {
+                __trace('answer', 'collect-comments:start', { index: i + 1, answerId, commentCount });
                 const comments = await __fetchCommentsForAnswer(answerId);
-                md += __commentsBlockMarkdown(comments);
+                __trace('answer', 'collect-comments:done', { index: i + 1, answerId, roots: comments.length });
+                commentsMd = __commentsBlockMarkdown(comments);
             }
-
             closeCommentModal(); // 确保关闭弹窗
-            md += `--- \n\n`;
+            md += __renderAnswerMarkdown({
+                index: i + 1,
+                authorName,
+                authorUrl,
+                upvoteCount,
+                commentCount,
+                time,
+                contentMd,
+                commentsMd
+            });
             await yieldToBrowser(0);
         }
 
@@ -706,63 +1007,490 @@
         }
 
         try {
-            const commentCount = __getCommentCountFromAnswer(answerEl);
-            if (commentCount === '0') return [];
-
-            // 1. 点击评论按钮
-            const commentBtn = answerEl.querySelector('.ContentItem-actions button:has(.Zi--Comment)');
+            __throwIfStopRequested('comments', 'stop-before-open');
+            const commentBtn = __getCommentActionButton(answerEl);
             if (!commentBtn) return [];
 
+            const commentCount = __getCommentCountFromAnswer(answerEl);
+            const rawCommentText = __getCommentButtonText(commentBtn);
+            if (commentCount === '0' && /(^|[^\d])0\s*(条)?评论/.test(rawCommentText)) return [];
+            __trace('comments', 'open-inline', { answerId, commentCount });
+
+            const globalTriggerBaseline = __snapshotGlobalCommentTriggers(answerEl);
+            const globalBaseline = __snapshotGlobalCommentsRoots(answerEl);
+
+            // 1. 点击评论按钮
             commentBtn.click();
-            await new Promise(r => setTimeout(r, 1500));
+            await __sleep(COMMENT_OPEN_WAIT_TIMEOUT);
 
-            // 2. 检查是否有"查看全部"按钮
-            const viewAllBtn = answerEl.querySelector('.css-vurnku');
-            if (viewAllBtn && viewAllBtn.textContent.includes('查看全部')) {
-                // 有弹窗的情况
-                viewAllBtn.click();
-                await new Promise(r => setTimeout(r, 2000));
+            let commentsRoot = await __waitForCommentsModalReady(answerEl, globalBaseline);
+            if (!commentsRoot) {
+                commentsRoot = await __findFreshFullCommentsRoot(answerEl, globalBaseline);
+            }
 
-                console.log(`有嵌入式评论弹窗，打开获取.....${answerId}`);
+            if (!commentsRoot) {
+                // 2. 没有直接出现完整评论根时，再查"查看全部评论"入口
+                const viewAllBtn = await __waitForViewAllCommentsTrigger(answerEl, globalTriggerBaseline);
+                if (viewAllBtn) {
+                    __trace('comments', 'expand-full-entry', { answerId, trigger: viewAllBtn.textContent?.replace(/\s+/g, ' ').trim() });
+                    __clickElement(viewAllBtn);
+                    await __sleep(COMMENT_OPEN_WAIT_TIMEOUT);
+                    commentsRoot = await __findFullCommentsRoot(answerEl, globalBaseline);
+                }
+            }
 
-                const modalContent = document.querySelector('.Modal-content.css-1svde17');
-                if (modalContent) {
-                    const scrollContainer = modalContent.querySelector('.css-34podr');
+                if (commentsRoot) {
+                    __trace('comments', 'full-root-ready', {
+                        answerId,
+                        rootClass: commentsRoot.className || commentsRoot.id || commentsRoot.tagName,
+                        rootItems: commentsRoot.querySelectorAll('[data-id], .CommentItem').length
+                    });
+                    const scrollContainer = __findCommentScrollContainer(commentsRoot);
                     if (scrollContainer) {
+                        const targetCount = __getDisplayedCommentTotal(commentsRoot);
                         let lastHeight = 0;
-                        for (let i = 0; i < RETRY_SCROLL_BOTTOM_TIMES; i++) {
+                        let lastCount = 0;
+                        let stablePasses = 0;
+                        const maxScrollPasses = Math.max(RETRY_SCROLL_BOTTOM_TIMES * 4, 20);
+
+                        for (let i = 0; i < maxScrollPasses; i++) {
                             // 人性化滑动到底部
                             await humanLikeScrollContainerToBottom(scrollContainer);
 
-                            await new Promise(r => setTimeout(r, DEFAULT_COMMENT_FETCH_TIMEOUT));
-                            if (scrollContainer.scrollHeight === lastHeight) break;
-                            lastHeight = scrollContainer.scrollHeight;
+                            const growthResult = await __waitForCommentPanelProgress(
+                                commentsRoot,
+                                scrollContainer,
+                                { timeoutMs: COMMENT_PANEL_WAIT_TIMEOUT, stablePollLimit: 3 }
+                            );
+                            if (growthResult.cancelled) throw __createStopError();
+                            __trace('comments', 'scroll-pass', {
+                                answerId,
+                                pass: i + 1,
+                                changed: growthResult.changed,
+                                height: growthResult.height,
+                                count: growthResult.count,
+                                targetCount
+                            });
+                            if (targetCount > 0 && growthResult.count >= targetCount) break;
+                            if (!growthResult.changed
+                                && growthResult.height === lastHeight
+                                && growthResult.count === lastCount) {
+                                stablePasses++;
+                                if (stablePasses >= 3) break;
+                            } else {
+                                stablePasses = 0;
+                            }
+                            lastHeight = growthResult.height;
+                            lastCount = growthResult.count;
                         }
 
-                        const commentsList = modalContent.querySelector('.css-18ld3w0');
-                        const comments = __extractCommentsFromPopup(commentsList);
-                        closeCommentModal();
-                        console.log(`Found ${comments.length} comments for answer ${answerId}.`);
-                        return comments;
-                    }
+                    const commentsList = __findCommentListContainer(commentsRoot) || commentsRoot;
+                    const comments = __extractCommentsFromPopup(commentsList);
+                    await __collectNestedReplies(commentsRoot, comments);
+                    __collapseAnswerComments(answerEl);
+                    __trace('comments', 'full-root-extracted', { answerId, roots: comments.length });
+                    closeCommentModal();
+                    return comments;
                 }
             } else {
                 // 3. 没有"查看全部"按钮，从内嵌评论获取
-                console.log(`没有弹窗，直接从内嵌评论获取 ${answerId}.`);
-                const embeddedComments = answerEl.querySelector('.css-18ld3w0');
+                __trace('comments', 'inline-only', { answerId });
+                const embeddedComments = __findCommentListContainer(answerEl);
                 if (embeddedComments) {
                     const comments = __extractCommentsFromPopup(embeddedComments);
-                    console.log(`Found ${comments.length} embedded comments for question answer ${answerId}.`);
+                    __collapseAnswerComments(answerEl);
+                    __trace('comments', 'inline-extracted', { answerId, roots: comments.length });
                     return comments;
                 }
             }
 
             return [];
         } catch (e) {
+            if (__isStopError(e)) {
+                throw e;
+            }
             console.warn('Failed to get comments:', e);
             closeCommentModal();
             return [];
         }
+    }
+
+    function __findCommentModalContent() {
+        return document.querySelector('[role="dialog"] .Modal-content, .Modal-content, [role="dialog"]');
+    }
+
+    function __findViewAllCommentsTrigger(root) {
+        if (!root?.querySelectorAll) return null;
+        const explicit = root.querySelector('.css-vurnku');
+        if (explicit && /^(点击)?查看全部评论$/.test((explicit.textContent || '').replace(/\s+/g, ' ').trim())) {
+            return explicit;
+        }
+        const exactSelectors = ['.css-vurnku', 'button', '[role="button"]', 'div', 'span'];
+        const candidates = root.querySelectorAll(exactSelectors.join(', '));
+        for (const el of candidates) {
+            const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
+            if (/^(点击)?查看全部评论$/.test(text) || /^查看全部评论$/.test(text)) return el;
+        }
+        return null;
+    }
+
+    function __snapshotGlobalCommentTriggers(answerEl) {
+        const searchRoot = __getAnswerSearchRoot(answerEl);
+        const candidates = document.querySelectorAll('.css-vurnku, button, [role="button"], div, span');
+        const snapshot = new Set();
+        for (const el of candidates) {
+            if (!el?.textContent) continue;
+            if (el.hidden) continue;
+            if (el.closest('[hidden]')) continue;
+            if (searchRoot.contains(el)) continue;
+            const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
+            if (/^(点击)?查看全部评论$/.test(text) || /^查看全部评论$/.test(text)) {
+                snapshot.add(el);
+            }
+        }
+        return snapshot;
+    }
+
+    function __findFreshGlobalCommentsTrigger(answerEl, baseline = null) {
+        const searchRoot = __getAnswerSearchRoot(answerEl);
+        const explicit = document.querySelector('.css-vurnku');
+        if (explicit && !searchRoot.contains(explicit) && !baseline?.has(explicit)) {
+            const text = (explicit.textContent || '').replace(/\s+/g, ' ').trim();
+            if (/^(点击)?查看全部评论$/.test(text) || /^查看全部评论$/.test(text)) {
+                return explicit;
+            }
+        }
+        const candidates = document.querySelectorAll('.css-vurnku, button, [role="button"], div, span');
+        for (const el of candidates) {
+            if (!el?.textContent) continue;
+            if (el.hidden) continue;
+            if (el.closest('[hidden]')) continue;
+            if (searchRoot.contains(el)) continue;
+            if (baseline?.has(el)) continue;
+            const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
+            if (/^(点击)?查看全部评论$/.test(text) || /^查看全部评论$/.test(text)) {
+                return el;
+            }
+        }
+        return null;
+    }
+
+    function __findSingleVisibleGlobalCommentsTrigger(answerEl) {
+        const searchRoot = __getAnswerSearchRoot(answerEl);
+        const explicit = document.querySelector('.css-vurnku');
+        if (explicit && !searchRoot.contains(explicit) && !explicit.hidden && !explicit.closest('[hidden]')) {
+            const text = (explicit.textContent || '').replace(/\s+/g, ' ').trim();
+            if (/^(点击)?查看全部评论$/.test(text) || /^查看全部评论$/.test(text)) {
+                return explicit;
+            }
+        }
+        const candidates = Array.from(document.querySelectorAll('.css-vurnku, button, [role="button"], div, span'))
+            .filter(el => {
+                if (!el?.textContent) return false;
+                if (el.hidden) return false;
+                if (el.closest('[hidden]')) return false;
+                if (searchRoot.contains(el)) return false;
+                const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
+                return /^(点击)?查看全部评论$/.test(text) || /^查看全部评论$/.test(text);
+            });
+
+        return candidates.length === 1 ? candidates[0] : null;
+    }
+
+    function __findReplyThreadRoot(root) {
+        if (!root?.querySelectorAll) return null;
+        const candidates = Array.from(root.querySelectorAll('.css-tpyajk, .Modal-content, [role="dialog"]'));
+        return candidates.find(el =>
+            /评论回复/.test((el.textContent || '').replace(/\s+/g, ' ').trim())
+            && !!el.querySelector('.css-16zdamy')
+            && !!el.querySelector('.css-34podr [data-id], .css-34podr .CommentItem')
+        ) || null;
+    }
+
+    function __getAnswerSearchRoot(answerEl) {
+        if (!answerEl?.parentElement) return answerEl;
+        let node = answerEl;
+        let best = answerEl;
+
+        while (node.parentElement) {
+            const parent = node.parentElement;
+            const answerCount = parent.querySelectorAll('.AnswerItem').length;
+            if (answerCount > 1) break;
+            best = parent;
+            node = parent;
+        }
+
+        return best;
+    }
+
+    function __findBetweenAnswerAndNextAnswer(answerEl, selector) {
+        if (!answerEl || !selector) return null;
+        const searchRoot = __getAnswerSearchRoot(answerEl);
+        const answers = Array.from(document.querySelectorAll('.AnswerItem'));
+        const currentIndex = answers.indexOf(answerEl);
+        const nextAnswer = currentIndex >= 0 ? answers[currentIndex + 1] : null;
+        const candidates = Array.from(document.querySelectorAll(selector));
+
+        return candidates.find(node => {
+            if (!node) return false;
+            if (searchRoot.contains(node)) return false;
+            if (!(searchRoot.compareDocumentPosition(node) & Node.DOCUMENT_POSITION_FOLLOWING)) return false;
+            if (!nextAnswer) return true;
+            return !!(node.compareDocumentPosition(nextAnswer) & Node.DOCUMENT_POSITION_FOLLOWING);
+        }) || null;
+    }
+
+    function __findBetweenAnswerAndNextAnswer(answerEl, selector) {
+        if (!answerEl || !selector) return null;
+        const searchRoot = __getAnswerSearchRoot(answerEl);
+        const answers = Array.from(document.querySelectorAll('.AnswerItem'));
+        const currentIndex = answers.indexOf(answerEl);
+        const nextAnswer = currentIndex >= 0 ? answers[currentIndex + 1] : null;
+        const candidates = Array.from(document.querySelectorAll(selector));
+
+        return candidates.find(node => {
+            if (!node) return false;
+            if (searchRoot.contains(node)) return false;
+            if (!(searchRoot.compareDocumentPosition(node) & Node.DOCUMENT_POSITION_FOLLOWING)) return false;
+            if (!nextAnswer) return true;
+            return !!(node.compareDocumentPosition(nextAnswer) & Node.DOCUMENT_POSITION_FOLLOWING);
+        }) || null;
+    }
+
+    function __snapshotGlobalCommentsRoots(answerEl) {
+        const searchRoot = __getAnswerSearchRoot(answerEl);
+        const candidates = document.querySelectorAll('.css-tpyajk, [role="dialog"] .Modal-content, .Modal-content, [role="dialog"], .css-u76jt1, .css-840pn3, .css-18ld3w0');
+        const snapshot = new Map();
+        for (const el of candidates) {
+            if (!el?.querySelector) continue;
+            if (el.hidden) continue;
+            if (el.closest('[hidden]')) continue;
+            if (searchRoot.contains(el)) continue;
+            const count = el.querySelectorAll('[data-id], .CommentItem').length;
+            if (count > 0) snapshot.set(el, count);
+        }
+        return snapshot;
+    }
+
+    function __findFreshGlobalCommentsRoot(answerEl, baseline = null) {
+        const searchRoot = __getAnswerSearchRoot(answerEl);
+        const candidates = document.querySelectorAll('.css-tpyajk, [role="dialog"] .Modal-content, .Modal-content, [role="dialog"], .css-u76jt1, .css-840pn3, .css-18ld3w0');
+        let best = null;
+        let bestCount = 0;
+        let bestRank = -1;
+        for (const el of candidates) {
+            if (!el?.querySelector) continue;
+            if (el.hidden) continue;
+            if (el.closest('[hidden]')) continue;
+            if (searchRoot.contains(el)) continue;
+            const count = el.querySelectorAll('[data-id], .CommentItem').length;
+            if (count === 0) continue;
+            const previous = baseline?.get(el) || 0;
+            const rank = __commentsRootRank(el);
+            if (count > previous && (count > bestCount || (count === bestCount && rank > bestRank))) {
+                best = el;
+                bestCount = count;
+                bestRank = rank;
+            }
+        }
+        return best;
+    }
+
+    function __commentsRootRank(el) {
+        if (!el?.matches) return 0;
+        if (el.matches('.css-tpyajk')) return 5;
+        if (el.matches('.css-u76jt1')) return 4;
+        if (el.matches('.css-840pn3')) return 3;
+        if (el.matches('.css-18ld3w0')) return 2;
+        if (el.matches('[role="dialog"] .Modal-content, .Modal-content, [role="dialog"]')) return 1;
+        return 0;
+    }
+
+    function __findAnswerScopedCommentsRoot(root) {
+        if (!root?.querySelector) return null;
+        const candidates = [
+            '.css-tpyajk',
+            '.css-u76jt1',
+            '.css-840pn3',
+            '.css-18ld3w0',
+            '[role="dialog"] .Modal-content',
+            '.Modal-content',
+            '[role="dialog"]'
+        ];
+
+        for (const selector of candidates) {
+            const el = root.querySelector(selector);
+            if (el && el.querySelector('[data-id], .CommentItem')) return el;
+        }
+
+        return root.querySelector('[data-id], .CommentItem') ? root : null;
+    }
+
+    function __findExpandedCommentsRoot(root) {
+        return __findAnswerScopedCommentsRoot(root);
+    }
+
+    function __collapseAnswerComments(answerEl) {
+        if (!answerEl?.querySelectorAll) return;
+        const buttons = answerEl.querySelectorAll('button');
+        for (const button of buttons) {
+            const text = (button.textContent || '').replace(/\s+/g, ' ').trim();
+            if (/^收起评论$/.test(text)) {
+                __clickElement(button);
+                return;
+            }
+        }
+    }
+
+    function __pickExpandedCommentsRoot(answerEl) {
+        return __findAnswerScopedCommentsRoot(answerEl);
+    }
+
+    function __isCompleteCommentsRoot(root) {
+        if (!root?.querySelector) return false;
+        const itemCount = root.querySelectorAll('[data-id], .CommentItem').length;
+        if (itemCount === 0) return false;
+        const pendingTrigger = __findViewAllCommentsTrigger(root);
+        return !pendingTrigger;
+    }
+
+    async function __findFreshFullCommentsRoot(answerEl, globalBaseline = null) {
+        const searchRoot = __getAnswerSearchRoot(answerEl);
+        const initialInlineRoot = __findAnswerScopedCommentsRoot(searchRoot);
+
+        for (let i = 0; i < RETRY_SCROLL_BOTTOM_TIMES; i++) {
+            const picked = __findAnswerScopedCommentsRoot(searchRoot);
+            const freshGlobal = __findFreshGlobalCommentsRoot(answerEl, globalBaseline);
+
+            if (picked && picked !== initialInlineRoot && __isCompleteCommentsRoot(picked)) return picked;
+            if (freshGlobal && __isCompleteCommentsRoot(freshGlobal)) return freshGlobal;
+
+            __trace('comments', 'wait-full-root', {
+                pass: i + 1,
+                inlineItems: initialInlineRoot?.querySelectorAll?.('[data-id], .CommentItem')?.length || 0,
+                currentItems: picked?.querySelectorAll?.('[data-id], .CommentItem')?.length || 0,
+                freshGlobalItems: freshGlobal?.querySelectorAll?.('[data-id], .CommentItem')?.length || 0
+            });
+            await __sleep(COMMENT_OPEN_WAIT_TIMEOUT);
+        }
+
+        return null;
+    }
+
+    async function __waitForCommentsModalReady(answerEl, globalBaseline = null) {
+        for (let i = 0; i < RETRY_SCROLL_BOTTOM_TIMES; i++) {
+            const betweenRoot = __findBetweenAnswerAndNextAnswer(answerEl, '.Modal-content.css-1svde17, .css-tpyajk');
+            const freshGlobal = __findFreshGlobalCommentsRoot(answerEl, globalBaseline);
+            const candidate = betweenRoot || freshGlobal;
+            if (candidate) {
+                return candidate.matches('.css-tpyajk') ? candidate : (candidate.querySelector('.css-tpyajk') || candidate);
+            }
+            await __sleep(COMMENT_OPEN_WAIT_TIMEOUT);
+        }
+        return null;
+    }
+
+    async function __waitForViewAllCommentsTrigger(answerEl, globalBaseline = null) {
+        const searchRoot = __getAnswerSearchRoot(answerEl);
+        for (let i = 0; i < RETRY_SCROLL_BOTTOM_TIMES; i++) {
+            const trigger = __findViewAllCommentsTrigger(searchRoot);
+            if (trigger) return trigger;
+            const betweenTrigger = __findBetweenAnswerAndNextAnswer(answerEl, '.css-vurnku, button, [role="button"], div, span');
+            if (betweenTrigger) {
+                const text = (betweenTrigger.textContent || '').replace(/\s+/g, ' ').trim();
+                if (/^(点击)?查看全部评论$/.test(text) || /^查看全部评论$/.test(text)) return betweenTrigger;
+            }
+            const freshGlobal = __findFreshGlobalCommentsTrigger(answerEl, globalBaseline);
+            if (freshGlobal) return freshGlobal;
+            const singleVisible = __findSingleVisibleGlobalCommentsTrigger(answerEl);
+            if (singleVisible) return singleVisible;
+            await __sleep(COMMENT_OPEN_WAIT_TIMEOUT);
+        }
+        return null;
+    }
+
+    async function __findFullCommentsRoot(answerEl, globalBaseline = null) {
+        const fresh = await __findFreshFullCommentsRoot(answerEl, globalBaseline);
+        if (fresh) return fresh;
+        const fallback = __findAnswerScopedCommentsRoot(__getAnswerSearchRoot(answerEl));
+        return __isCompleteCommentsRoot(fallback) ? fallback : null;
+    }
+
+    function __clickElement(el) {
+        if (!el) return;
+        try { el.click(); } catch (_) { }
+        try {
+            el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+        } catch (_) { }
+    }
+
+    function __findCommentScrollContainer(root) {
+        if (!root?.querySelectorAll) return null;
+        const explicit = root.querySelector('.css-840pn3, .css-34podr, [class*="scroll"]');
+        if (explicit) return explicit;
+        const candidates = [root, ...root.querySelectorAll('*')];
+        for (const el of candidates) {
+            if (el.scrollHeight > el.clientHeight + 24) return el;
+        }
+        return root;
+    }
+
+    function __findCommentListContainer(root) {
+        if (!root?.querySelector) return null;
+
+        const explicit = root.querySelector(
+            '.Comments-container, .CommentsV2, .CommentsV2-list, .CommentListV2, [class*="Comments"]'
+        );
+        if (explicit) return explicit;
+
+        const firstComment = root.querySelector('.CommentItem, [data-id][class*="Comment"], [data-id]');
+        return firstComment?.parentElement || null;
+    }
+
+    function __getDisplayedCommentTotal(root) {
+        const text = (root?.textContent || '').replace(/\s+/g, ' ');
+        const match = text.match(/(\d+)\s*条评论/);
+        return match ? Number(match[1]) : 0;
+    }
+
+    async function __waitForCommentPanelProgress(commentsRoot, scrollContainer, options = {}) {
+        const {
+            timeoutMs = COMMENT_PANEL_WAIT_TIMEOUT,
+            intervalMs = WAIT_POLL_INTERVAL,
+            stablePollLimit = 2
+        } = options;
+
+        let lastHeight = scrollContainer.scrollHeight;
+        let lastCount = commentsRoot.querySelectorAll('[data-id], .CommentItem').length;
+        let stablePolls = 0;
+        const startedAt = Date.now();
+
+        while (Date.now() - startedAt < timeoutMs) {
+            if (__zudRunState.requested) {
+                return { changed: false, height: lastHeight, count: lastCount, cancelled: true };
+            }
+            await __sleep(intervalMs);
+
+            const nextHeight = scrollContainer.scrollHeight;
+            const nextCount = commentsRoot.querySelectorAll('[data-id], .CommentItem').length;
+            const changed = nextHeight > lastHeight || nextCount > lastCount;
+
+            if (changed) {
+                return { changed: true, height: nextHeight, count: nextCount, cancelled: false };
+            }
+
+            stablePolls++;
+            if (stablePolls >= stablePollLimit) {
+                return { changed: false, height: nextHeight, count: nextCount, cancelled: false };
+            }
+        }
+
+        return {
+            changed: false,
+            height: scrollContainer.scrollHeight,
+            count: commentsRoot.querySelectorAll('[data-id], .CommentItem').length,
+            cancelled: false
+        };
     }
 
     function __extractCommentsFromContainer(container) {
@@ -789,43 +1517,193 @@
         return comments;
     }
 
-    // 修复评论提取函数
+    function __getCommentUserTexts(item) {
+        const links = Array.from(item.querySelectorAll('.UserLink, a[href*="/people/"], a[class*="Link"]'));
+        return links
+            .map(link => (link.textContent || '').replace(/\s+/g, ' ').trim())
+            .filter(Boolean);
+    }
+
+    function __getCommentTimeFromItem(item) {
+        const semanticTime = item.querySelector('time, [datetime]');
+        const semanticText = (semanticTime?.textContent || semanticTime?.getAttribute?.('datetime') || '').trim();
+        if (semanticText) return semanticText;
+
+        const footer = item.querySelector('.css-x1xlu5, [class*="CommentMeta"], [class*="meta"], [class*="Footer"]');
+        if (footer) {
+            const spanTexts = Array.from(footer.querySelectorAll('span'))
+                .map(span => (span.textContent || '').replace(/\s+/g, ' ').trim())
+                .filter(text => text && text !== '·');
+            if (spanTexts.length > 0) return spanTexts[0];
+        }
+
+        return '';
+    }
+
+    function __extractSingleCommentItem(item) {
+        if (!item) return null;
+
+        const userTexts = __getCommentUserTexts(item);
+        const author = userTexts[0] || item.querySelector('img[alt]')?.getAttribute('alt') || '匿名用户';
+        const contentNode = item.querySelector('.CommentContent, [class*="CommentContent"], .RichText, .ztext');
+        const content = contentNode?.textContent?.replace(/\s+/g, ' ')?.trim() || '';
+        if (!content) return null;
+
+        const likeBtn = Array.from(item.querySelectorAll('button, .Button'))
+            .find(el => /(赞|喜欢|\d)/.test((el.textContent || '').trim()));
+        const likeCount = __parseZhihuCount(likeBtn?.textContent || '');
+        const time = __getCommentTimeFromItem(item);
+        const hasReplyArrow = !!item.querySelector('.css-gx7lzm, [class*="ArrowRight"]');
+        const replyTo = hasReplyArrow ? (userTexts[1] || null) : null;
+
+        const comment = {
+            author: { name: author },
+            content,
+            like_count: likeCount,
+            created_time: time,
+            reply_to: replyTo
+        };
+        Object.defineProperty(comment, '__commentId', {
+            value: item.getAttribute('data-id') || '',
+            enumerable: false
+        });
+        return comment;
+    }
+
     function __extractCommentsFromPopup(commentsList) {
         const comments = [];
-        const commentItems = commentsList.querySelectorAll('[data-id]');
+        if (!commentsList) return comments;
 
-        commentItems.forEach(item => {
-            const userLink = item.querySelector('a.css-10u695f');
-            const author = userLink?.textContent || '匿名用户';
-            const content = item.querySelector('.CommentContent')?.textContent || '';
-
-            const likeBtn = item.querySelector('.Button--grey');
-            const likeText = likeBtn?.textContent || '0';
-            const likeCount = likeText.match(/\d+/)?.[0] || '0';
-
-            // 修复时间获取
-            const timeEl = item.querySelector('.css-12cl38p');
-            const time = timeEl?.textContent || '';
-
-            const replyTo = item.querySelector('.css-gx7lzm') ?
-                item.querySelectorAll('a.css-10u695f')[1]?.textContent : null;
-
-            if (content) {
-                comments.push({
-                    author: { name: author },
-                    content: content,
-                    like_count: likeCount,
-                    created_time: time,
-                    reply_to: replyTo
-                });
+        const nestedReplyContainer = commentsList.querySelector('.css-16zdamy');
+        if (nestedReplyContainer) {
+            const rootItem = commentsList.querySelector('.css-34podr [data-id], .css-34podr .CommentItem');
+            const rootComment = __extractSingleCommentItem(rootItem);
+            if (rootComment) {
+                rootComment.child_comments_full = Array.from(nestedReplyContainer.children)
+                    .filter(node => node.nodeType === Node.ELEMENT_NODE && node.matches('[data-id], .CommentItem'))
+                    .map(__extractSingleCommentItem)
+                    .filter(Boolean);
+                return [rootComment];
             }
-        });
+        }
 
+        const commentItems = commentsList.querySelectorAll('.CommentItem, [data-id][class*="Comment"], [data-id]');
+        commentItems.forEach(item => {
+            const comment = __extractSingleCommentItem(item);
+            if (comment) comments.push(comment);
+        });
         return comments;
     }
 
+    function __isReplyExpansionButton(button) {
+        const text = (button?.textContent || '').replace(/\s+/g, ' ').trim();
+        return /(查看全部|展开其他).*(条)?回复/.test(text);
+    }
+
+    function __findReplyModalBackControl(root) {
+        if (!root?.querySelectorAll) return null;
+        const candidates = Array.from(root.querySelectorAll('button, [role="button"], div'));
+        return candidates.find(el => {
+            const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
+            return /评论回复/.test(text) && el.querySelector('[class*="ArrowLeft"], .ZDI--ArrowLeftSmall24');
+        }) || null;
+    }
+
+    async function __collectNestedReplies(containerRoot, rootComments, options = {}) {
+        if (!containerRoot || !rootComments?.length) return;
+        const {
+            maxThreads = MAX_NESTED_REPLY_THREADS_PER_ANSWER
+        } = options;
+
+        const rootMap = new Map(
+            rootComments
+                .filter(comment => comment.__commentId)
+                .map(comment => [comment.__commentId, comment])
+        );
+        if (rootMap.size === 0) return;
+
+        const visitedOwnerIds = new Set();
+        let processedThreads = 0;
+        let previousButtonCount = -1;
+
+        for (let pass = 0; pass < RETRY_SCROLL_BOTTOM_TIMES; pass++) {
+            const replyButtons = Array.from(containerRoot.querySelectorAll('button'))
+                .filter(button => __isReplyExpansionButton(button));
+            __trace('replies', 'scan-start', {
+                roots: rootComments.length,
+                buttons: replyButtons.length,
+                maxThreads,
+                pass: pass + 1
+            });
+
+            if (replyButtons.length === previousButtonCount && pass > 0) {
+                break;
+            }
+            previousButtonCount = replyButtons.length;
+
+            for (const button of replyButtons) {
+                __throwIfStopRequested('replies', 'stop-during-expand');
+                const owner = button.closest('[data-id]');
+                const ownerId = owner?.getAttribute('data-id') || '';
+                if (!ownerId || !rootMap.has(ownerId)) continue;
+                if (visitedOwnerIds.has(ownerId)) {
+                    __trace('replies', 'skip-visited', { ownerId });
+                    continue;
+                }
+                if (processedThreads >= maxThreads) {
+                    console.warn(`Nested reply expansion capped at ${maxThreads} threads.`);
+                    return;
+                }
+                visitedOwnerIds.add(ownerId);
+                processedThreads++;
+                __trace('replies', 'expand-thread', {
+                    ownerId,
+                    thread: processedThreads,
+                    label: button.textContent?.replace(/\s+/g, ' ').trim()
+                });
+
+                try {
+                    __clickElement(button);
+                    await __sleep(COMMENT_OPEN_WAIT_TIMEOUT);
+
+                    let nestedRoot = null;
+                    for (let i = 0; i < RETRY_SCROLL_BOTTOM_TIMES; i++) {
+                        nestedRoot = __findReplyThreadRoot(containerRoot) || __findReplyThreadRoot(document) || __findExpandedCommentsRoot(containerRoot);
+                        if (nestedRoot && nestedRoot !== containerRoot) break;
+                        await __sleep(COMMENT_OPEN_WAIT_TIMEOUT);
+                    }
+                    nestedRoot = nestedRoot || __findExpandedCommentsRoot(containerRoot) || containerRoot;
+                    const nestedComments = __extractCommentsFromPopup(nestedRoot);
+                    if (nestedComments[0]?.child_comments_full?.length) {
+                        rootMap.get(ownerId).child_comments_full = nestedComments[0].child_comments_full;
+                        __trace('replies', 'expand-thread:done', {
+                            ownerId,
+                            children: nestedComments[0].child_comments_full.length
+                        });
+                    }
+
+                    const backControl = __findReplyModalBackControl(nestedRoot) || __findReplyModalBackControl(containerRoot);
+                    if (backControl) {
+                        __clickElement(backControl);
+                        await __sleep(COMMENT_OPEN_WAIT_TIMEOUT);
+                    }
+                } catch (error) {
+                    console.warn('Failed to collect nested replies for comment:', ownerId, error);
+                }
+            }
+
+            const listContainer = __findCommentScrollContainer(containerRoot);
+            if (listContainer) {
+                await humanLikeScrollContainerToBottom(listContainer);
+                await __sleep(COMMENT_OPEN_WAIT_TIMEOUT);
+            }
+        }
+    }
+
     function closeCommentModal() {
-        const closeBtn = document.querySelector('button[aria-label="关闭"].css-169m58j, button[aria-label="关闭"]:has(.Zi--Close)');
+        const closeBtn = document.querySelector(
+            '[role="dialog"] button[aria-label="关闭"], button[aria-label="关闭"], button:has(.Zi--Close)'
+        );
         if (closeBtn) {
             closeBtn.click();
         } else {
@@ -947,18 +1825,51 @@
     // 在 __commentsBlockMarkdown 函数之前添加：
 
     function __commentToMarkdown(comment, level = 0) {
-        const indent = '  '.repeat(level);
         const author = comment.author?.name || '匿名用户';
         const content = comment.content || comment.comment?.content || '';
         const likeCount = comment.like_count || comment.vote_count || '0';
-        const time = comment.created_time ? __formatUnixTs(comment.created_time) : '';
+        const time = __normalizeCommentTime(comment.created_time);
 
-        let md = `${indent}**${__mdEscape(author)}**`;
-        if (likeCount !== '0') md += ` (${likeCount}赞)`;
-        if (time) md += ` · ${time}`;
-        md += `\n${indent}${__mdEscape(content)}\n\n`;
+        let line = `${__mdEscape(author)}`;
+        if (comment.reply_to) line += ` -> ${__mdEscape(comment.reply_to)}`;
+        if (time) line += ` [${time}]`;
+        if (likeCount !== '0') line += ` ${likeCount}赞`;
+        return `${line}\n${__mdEscape(content)}`;
+    }
 
-        return md;
+    function __normalizeCommentTime(value) {
+        if (value === null || value === undefined) return '';
+        if (typeof value === 'number' && Number.isFinite(value)) {
+            return __formatUnixTs(value);
+        }
+
+        const raw = String(value).trim();
+        if (!raw) return '';
+        if (/^\d{10}$/.test(raw)) return __formatUnixTs(Number(raw));
+        if (/^\d{13}$/.test(raw)) return __formatUnixTs(Math.floor(Number(raw) / 1000));
+        const relative = raw.match(/^(今天|昨天|前天)(?:\s+(\d{1,2}:\d{2}))?$/);
+        if (relative) {
+            const base = new Date();
+            base.setHours(0, 0, 0, 0);
+            const offset = relative[1] === '今天' ? 0 : relative[1] === '昨天' ? 1 : 2;
+            base.setDate(base.getDate() - offset);
+            return __formatCalendarDate(base, relative[2] || '');
+        }
+        const monthDay = raw.match(/^(\d{2})-(\d{2})(?:\s+(\d{1,2}:\d{2}))?$/);
+        if (monthDay) {
+            const base = new Date();
+            const year = base.getFullYear();
+            const d = new Date(year, Number(monthDay[1]) - 1, Number(monthDay[2]));
+            return __formatCalendarDate(d, monthDay[3] || '');
+        }
+        return raw;
+    }
+
+    function __formatCalendarDate(date, timePart = '') {
+        const y = date.getFullYear();
+        const M = String(date.getMonth() + 1).padStart(2, '0');
+        const D = String(date.getDate()).padStart(2, '0');
+        return timePart ? `${y}-${M}-${D} ${timePart}` : `${y}-${M}-${D}`;
     }
 
     function __buildChildTree(childComments) {
@@ -966,17 +1877,37 @@
         return childComments || [];
     }
 
+    function __countCommentsDeep(roots) {
+        if (!roots || roots.length === 0) return 0;
+        let total = 0;
+        for (const root of roots) {
+            total += 1;
+            total += __countCommentsDeep(root.child_comments_full || []);
+        }
+        return total;
+    }
+
+    function __renderCommentTree(comment, prefix = '', isLast = true, isRoot = false) {
+        const line = __commentToMarkdown(comment).split('\n');
+        const marker = isRoot ? '- ' : `${prefix}${isLast ? '\\- ' : '|- '}`;
+        const bodyPrefix = isRoot ? '  ' : `${prefix}${isLast ? '   ' : '|  '}`;
+        let md = `${marker}${line[0]}\n`;
+        if (line[1]) md += `${bodyPrefix}${line[1]}\n`;
+
+        const children = __buildChildTree(comment.child_comments_full || []);
+        children.forEach((child, index) => {
+            md += __renderCommentTree(child, bodyPrefix, index === children.length - 1, false);
+        });
+        return md;
+    }
 
     function __commentsBlockMarkdown(roots) {
         if (!roots || roots.length === 0) return '';
-        let md = `#### 评论 (${roots.length})\n\n`;
-        for (const rc of roots) {
-            md += __commentToMarkdown(rc, 0);
-            if (rc.child_comments_full && rc.child_comments_full.length) {
-                const tree = __buildChildTree(rc.child_comments_full);
-                for (const t of tree) md += __commentToMarkdown(t, 1);
-            }
-        }
+        const total = __countCommentsDeep(roots);
+        let md = `#### 评论 (${total}，根评论 ${roots.length})\n\n`;
+        roots.forEach((rc, index) => {
+            md += __renderCommentTree(rc, '', index === roots.length - 1, true);
+        });
         md += '\n';
         return md;
     }
@@ -989,18 +1920,18 @@
         if (questionMoreButton && questionMoreButton.offsetParent !== null && questionMoreButton.innerText.includes('显示全部')) {
             questionMoreButton.click();
             expandedCount++;
-            await new Promise(resolve => setTimeout(resolve, 300));
+            await __sleep(150);
         }
         const buttons = document.querySelectorAll('.RichContent-collapsedText.Button--plain');
         for (const button of buttons) {
             if (button.offsetParent !== null) {
                 button.click();
                 expandedCount++;
-                await new Promise(resolve => setTimeout(resolve, 50));
+                await __sleep(30);
             }
         }
         console.log(`Expanded ${expandedCount} collapsed sections.`);
-        await new Promise(resolve => setTimeout(resolve, 1000));
+        await __sleep(200);
     }
 
     // Load all answers
@@ -1015,32 +1946,20 @@
         const listContainer = document.getElementById('QuestionAnswers-answers');
 
         for (let attempt = 0; attempt < maxAttempts; attempt++) {
+            __throwIfStopRequested('answers', 'stop-during-load-all');
             const answers = document.querySelectorAll('.AnswerItem');
             const now = answers.length;
             if (now >= totalAnswers) {
                 console.log(`Reached total answers ${now}/${totalAnswers}.`);
                 break;
             }
-            const last = answers[answers.length - 1];
-            if (last && last.scrollIntoView) {
-                last.scrollIntoView({ block: 'end' });
-            }
-            window.scrollBy(0, Math.max(200, Math.floor(window.innerHeight * 0.9)));
-            if (listContainer) {
-                try { listContainer.scrollTop = listContainer.scrollHeight; } catch (_) { }
-            }
-            const moreBtns = [
-                'button.ContentItem-more',
-                '.QuestionAnswers-answerList .PaginationButton',
-                'button:has(.Zi--ArrowDown)',
-                'button:has(.Zi--ChevronDown)'
-            ];
-            for (const sel of moreBtns) {
-                const btn = document.querySelector(sel);
-                if (btn && btn.offsetParent !== null) { try { btn.click(); } catch (_) { } }
-            }
-            await new Promise(r => setTimeout(r, DEFAULT_COMMENT_FETCH_TIMEOUT));
-            const after = document.querySelectorAll('.AnswerItem').length;
+            await __nudgeAnswerLoading();
+            const growthResult = await __waitForGrowth(
+                () => document.querySelectorAll('.AnswerItem').length,
+                { timeoutMs: ANSWER_LOAD_WAIT_TIMEOUT }
+            );
+            if (growthResult.cancelled) throw __createStopError();
+            const after = growthResult.value;
             if (after === lastCount) {
                 stagnant++;
             } else {
@@ -1053,7 +1972,7 @@
             }
         }
         window.scrollTo(0, 0);
-        await new Promise(r => setTimeout(r, 200));
+        await __sleep(120);
     }
 
     // Get all answers markdown
@@ -1071,18 +1990,19 @@
                 const authorUrl = authorEl?.href || '#';
                 const upvoteCount = __getUpvoteCountFromAnswer(answerEl);
                 const commentCount = __getCommentCountFromAnswer(answerEl);
-                const timeElement = answerEl.querySelector('time');
-                const time = timeElement ? (timeElement.getAttribute('data-tooltip') || timeElement.innerText || '').replace('发布于 ', '').replace('编辑于 ', '编辑于 ') : '未知时间';
+                const time = __getAnswerTimeFromAnswer(answerEl);
                 const contentHtml = answerEl.querySelector('.RichText.ztext')?.innerHTML || '';
                 const contentMd = turndownService.turndown(contentHtml);
 
-                chunks.push(`### ${index}. ${authorName}\n\n`);
-                if (authorUrl && authorUrl !== '#') {
-                    chunks.push(`[${authorName}](${authorUrl})\n\n`);
-                }
-                chunks.push(`**赞同:** ${upvoteCount} | **评论:** ${commentCount} | **时间:** ${time}\n\n`);
-                chunks.push(contentMd + '\n\n');
-                chunks.push(`--- \n\n`);
+                chunks.push(__renderAnswerMarkdown({
+                    index,
+                    authorName,
+                    authorUrl,
+                    upvoteCount,
+                    commentCount,
+                    time,
+                    contentMd
+                }));
             }
             await yieldToBrowser(0);
         }
@@ -1106,25 +2026,29 @@
                 const authorUrl = authorEl?.href || '#';
                 const upvoteCount = __getUpvoteCountFromAnswer(answerEl);
                 const commentCount = __getCommentCountFromAnswer(answerEl);
-                const timeElement = answerEl.querySelector('time');
-                const time = timeElement ? (timeElement.getAttribute('data-tooltip') || timeElement.innerText || '').replace('发布于 ', '').replace('编辑于 ', '编辑于 ') : '未知时间';
+                const time = __getAnswerTimeFromAnswer(answerEl);
                 const contentHtml = answerEl.querySelector('.RichText.ztext')?.innerHTML || '';
                 const contentMd = turndownService.turndown(contentHtml);
 
-                chunks.push(`### ${index}. ${authorName}\n\n`);
-                if (authorUrl && authorUrl !== '#') chunks.push(`[${authorName}](${authorUrl})\n\n`);
-                chunks.push(`**赞同:** ${upvoteCount} | **评论:** ${commentCount} | **时间:** ${time}\n\n`);
-                chunks.push(contentMd + '\n\n');
-
                 const answerId = __getAnswerId(answerEl);
+                let commentsMd = '';
                 if (answerId) {
                     const comments = await __fetchCommentsForAnswer(answerId);
-                    chunks.push(__commentsBlockMarkdown(comments));
+                    commentsMd = __commentsBlockMarkdown(comments);
                     closeCommentModal(); // 确保关闭弹窗
                 } else {
-                    chunks.push('_（未能识别回答 ID，评论跳过）_\n\n');
+                    commentsMd = '_（未能识别回答 ID，评论跳过）_';
                 }
-                chunks.push(`--- \n\n`);
+                chunks.push(__renderAnswerMarkdown({
+                    index,
+                    authorName,
+                    authorUrl,
+                    upvoteCount,
+                    commentCount,
+                    time,
+                    contentMd,
+                    commentsMd
+                }));
             }
             await yieldToBrowser(0);
         }
@@ -1153,18 +2077,19 @@
                     const authorUrl = authorEl?.href || '#';
                     const upvoteCount = __getUpvoteCountFromAnswer(answerEl);
                     const commentCount = __getCommentCountFromAnswer(answerEl);
-                    const timeElement = answerEl.querySelector('time');
-                    const time = timeElement ? (timeElement.getAttribute('data-tooltip') || timeElement.innerText || '').replace('发布于 ', '').replace('编辑于 ', '编辑于 ') : '未知时间';
+                    const time = __getAnswerTimeFromAnswer(answerEl);
                     const contentHtml = answerEl.querySelector('.RichText.ztext')?.innerHTML || '';
                     const contentMd = turndownService.turndown(contentHtml);
 
-                    chunks.push(`### ${selectedIndex}. ${authorName}\n\n`);
-                    if (authorUrl && authorUrl !== '#') {
-                        chunks.push(`[${authorName}](${authorUrl})\n\n`);
-                    }
-                    chunks.push(`**赞同:** ${upvoteCount} | **评论:** ${commentCount} | **时间:** ${time}\n\n`);
-                    chunks.push(contentMd + '\n\n');
-                    chunks.push(`--- \n\n`);
+                    chunks.push(__renderAnswerMarkdown({
+                        index: selectedIndex,
+                        authorName,
+                        authorUrl,
+                        upvoteCount,
+                        commentCount,
+                        time,
+                        contentMd
+                    }));
                 }
             }
             await yieldToBrowser(0);
@@ -1196,19 +2121,21 @@
                 const authorUrl = authorEl?.href || '#';
                 const upvoteCount = __getUpvoteCountFromAnswer(answerEl);
                 const commentCount = __getCommentCountFromAnswer(answerEl);
-                const timeElement = answerEl.querySelector('time');
-                const time = timeElement ? (timeElement.getAttribute('data-tooltip') || timeElement.innerText || '').replace('发布于 ', '').replace('编辑于 ', '编辑于 ') : '未知时间';
+                const time = __getAnswerTimeFromAnswer(answerEl);
                 const contentHtml = answerEl.querySelector('.RichText.ztext')?.innerHTML || '';
                 const contentMd = turndownService.turndown(contentHtml);
 
-                chunks.push(`### ${selectedIndex}. ${authorName}\n\n`);
-                if (authorUrl && authorUrl !== '#') chunks.push(`[${authorName}](${authorUrl})\n\n`);
-                chunks.push(`**赞同:** ${upvoteCount} | **评论:** ${commentCount} | **时间:** ${time}\n\n`);
-                chunks.push(contentMd + '\n\n');
-
                 const comments = await __fetchCommentsForAnswer(token);
-                chunks.push(__commentsBlockMarkdown(comments));
-                chunks.push(`--- \n\n`);
+                chunks.push(__renderAnswerMarkdown({
+                    index: selectedIndex,
+                    authorName,
+                    authorUrl,
+                    upvoteCount,
+                    commentCount,
+                    time,
+                    contentMd,
+                    commentsMd: __commentsBlockMarkdown(comments)
+                }));
                 closeCommentModal(); // 确保关闭弹窗
             }
             await yieldToBrowser(0);
@@ -1313,6 +2240,7 @@
         button.addEventListener('click', async () => {
             button.innerText = '正在加载回答...';
             button.disabled = true;
+            __beginOperation('download-all');
             console.log("Starting download all...");
 
             try {
@@ -1333,9 +2261,16 @@
                 downloadMarkdownFile(filename, fullMarkdown);
                 button.innerText = '下载完成!';
                 console.log("Download all complete!");
+                __endOperation('done');
             } catch (error) {
-                console.error("An error occurred during download all:", error);
-                button.innerText = '下载失败!';
+                if (__isStopError(error)) {
+                    button.innerText = '已停止!';
+                    __endOperation('stopped');
+                } else {
+                    console.error("An error occurred during download all:", error);
+                    button.innerText = '下载失败!';
+                    __endOperation('error');
+                }
             } finally {
                 button.disabled = false;
                 setTimeout(() => {
@@ -1357,6 +2292,7 @@
         button.addEventListener('click', async () => {
             button.disabled = true;
             button.innerText = '正在加载回答...';
+            __beginOperation('download-all-comments');
             try {
                 await loadAllAnswers();
                 button.innerText = '正在展开内容...';
@@ -1369,9 +2305,16 @@
                 const filename = `${sanitizeFilename(questionTitle)}_${formatDownloadDateTime()}_all_with_comments.md`;
                 downloadMarkdownFile(filename, fullMd);
                 button.innerText = '下载完成!';
+                __endOperation('done');
             } catch (e) {
-                console.error(e);
-                button.innerText = '下载失败!';
+                if (__isStopError(e)) {
+                    button.innerText = '已停止!';
+                    __endOperation('stopped');
+                } else {
+                    console.error(e);
+                    button.innerText = '下载失败!';
+                    __endOperation('error');
+                }
             } finally {
                 setTimeout(() => {
                     button.innerText = '下载全部回答（含评论）';
@@ -1398,6 +2341,7 @@
             }
             button.innerText = '正在展开内容...';
             button.disabled = true;
+            __beginOperation('download-selected');
             console.log("Starting selected answers download...");
 
             try {
@@ -1414,9 +2358,16 @@
                 downloadMarkdownFile(filename, fullMarkdown);
                 button.innerText = '下载完成!';
                 console.log("Download complete!");
+                __endOperation('done');
             } catch (error) {
-                console.error("An error occurred during selected download:", error);
-                button.innerText = '下载失败!';
+                if (__isStopError(error)) {
+                    button.innerText = '已停止!';
+                    __endOperation('stopped');
+                } else {
+                    console.error("An error occurred during selected download:", error);
+                    button.innerText = '下载失败!';
+                    __endOperation('error');
+                }
             } finally {
                 updateDownloadButtonCount();
                 setTimeout(() => {
@@ -1444,6 +2395,7 @@
             }
             button.disabled = true;
             button.innerText = '正在展开内容...';
+            __beginOperation('download-selected-comments');
             try {
                 await expandCollapsedContent();
                 button.innerText = '正在抓取评论...';
@@ -1454,9 +2406,16 @@
                 const filename = `${sanitizeFilename(questionTitle)}_${formatDownloadDateTime()}_selected_with_comments.md`;
                 downloadMarkdownFile(filename, fullMd);
                 button.innerText = '下载完成!';
+                __endOperation('done');
             } catch (e) {
-                console.error(e);
-                button.innerText = '下载失败!';
+                if (__isStopError(e)) {
+                    button.innerText = '已停止!';
+                    __endOperation('stopped');
+                } else {
+                    console.error(e);
+                    button.innerText = '下载失败!';
+                    __endOperation('error');
+                }
             } finally {
                 setTimeout(() => {
                     button.innerText = '下载已选回答（含评论）';
