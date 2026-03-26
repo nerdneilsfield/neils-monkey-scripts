@@ -1,27 +1,98 @@
 // ==UserScript==
 // @name         知乎问题回答批量/选择性导出为 Markdown
-// @namespace    http://tampermonkey.net/
+// @namespace    https://github.com/nerdneilsfield
 // @version      0.9.0
 // @description  在知乎问题页提供下载全部回答或选择部分回答导出为 Markdown 的功能
 // @author       Qi Deng
+// @license      LGPL-3.0
 // @match        https://www.zhihu.com/question/*
-// @require      https://cdn.jsdelivr.net/npm/turndown@7.2.0/lib/turndown.umd.js
+// @require      https://cdn.jsdelivr.net/npm/turndown@7.2.0/lib/turndown.umd.js#sha256=bNU+0rwWe4WVADj+kwuhXm7nhfx2/c/hbaHk979TOpw=
+// @homepageURL  https://github.com/nerdneilsfield/neils-monkey-scripts
+// @supportURL   https://github.com/nerdneilsfield/neils-monkey-scripts/issues
 // @downloadURL https://github.com/nerdneilsfield/neils-monkey-scripts/raw/refs/heads/master/scripts/forum/zhihu.user.js
 // @updateURL https://github.com/nerdneilsfield/neils-monkey-scripts/raw/refs/heads/master/scripts/forum/zhihu.user.js
+// @run-at       document-idle
+// @noframes
 // @grant        none
 // ==/UserScript==
 
 (function () {
     'use strict';
 
-    const ANSWER_LOAD_WAIT_TIMEOUT = 1800;
-    const COMMENT_PANEL_WAIT_TIMEOUT = 1200;
-    const COMMENT_OPEN_WAIT_TIMEOUT = 600;
-    const WAIT_POLL_INTERVAL = 120;
-    const STABLE_POLL_LIMIT = 3;
-    const RETRY_SCROLL_BOTTOM_TIMES = 6;
-    const MAX_NESTED_REPLY_THREADS_PER_ANSWER = 80;
-    const STOP_ERROR_MESSAGE = '__ZUD_STOP__';
+    // --- Configuration / Selector Inventory ---
+
+    const LIMITS = {
+        answerLoadWaitTimeout: 1800,
+        commentPanelWaitTimeout: 1200,
+        commentOpenWaitTimeout: 600,
+        waitPollInterval: 120,
+        stablePollLimit: 3,
+        retryScrollBottomTimes: 6,
+        maxNestedReplyThreadsPerAnswer: 80
+    };
+
+    const LABELS = {
+        anonymousUser: '匿名用户',
+        anonymousAuthor: 'Anonymous',
+        defaultQuestionTitle: '知乎问题',
+        defaultLogTitle: '知乎日志',
+        noTitle: 'No Title',
+        stopErrorMessage: '__ZUD_STOP__'
+    };
+
+    // Selector inventory:
+    // - answer loading
+    // - comment trigger discovery
+    // - full comment roots
+    // - reply thread roots
+    // - metadata extraction
+    // Semantic selectors stay primary; hashed class fallbacks stay secondary.
+    const SELECTORS = {
+        questionTitle: '.QuestionHeader-title',
+        questionDescription: '.QuestionRichText .RichText.ztext',
+        questionTopics: '.QuestionHeader-topics .Tag-content a',
+        questionAuthor: '.QuestionAuthor .AuthorInfo-name a',
+        questionFollowerCount: '.QuestionFollowStatus .NumberBoard-item:nth-child(1) .NumberBoard-itemValue',
+        questionViewCount: '.QuestionFollowStatus .NumberBoard-item:nth-child(2) .NumberBoard-itemValue',
+        answerItem: '.AnswerItem',
+        answerMeta: '.ContentItem-meta',
+        answerAuthorLink: '.AuthorInfo-name a',
+        answerContent: '.RichText.ztext',
+        answerListHeader: '.List-headerText',
+        answerListHeaderCount: '.List-headerText span',
+        answerExpandButtons: 'button.ContentItem-expandButton, .ContentItem-rightButton.ContentItem-expandButton',
+        questionMoreButton: '.QuestionRichText-more',
+        collapsedContentButtons: '.RichContent-collapsedText.Button--plain',
+        globalCommentTriggerCandidates: '.css-vurnku, button, [role="button"], div, span',
+        exactViewAllTrigger: '.css-vurnku',
+        globalCommentRootCandidates: '.css-tpyajk, [role="dialog"] .Modal-content, .Modal-content, [role="dialog"], .css-u76jt1, .css-840pn3, .css-18ld3w0',
+        scopedCommentRootCandidates: [
+            '.css-tpyajk',
+            '.css-u76jt1',
+            '.css-840pn3',
+            '.css-18ld3w0',
+            '[role="dialog"] .Modal-content',
+            '.Modal-content',
+            '[role="dialog"]'
+        ],
+        commentScrollCandidates: '.css-840pn3, .css-34podr, [class*="scroll"]',
+        commentListCandidates: '.Comments-container, .CommentsV2, .CommentsV2-list, .CommentListV2, [class*="Comments"]',
+        commentItems: '[data-id], .CommentItem',
+        commentModalClose: '[role="dialog"] button[aria-label="关闭"], button[aria-label="关闭"], button:has(.Zi--Close)',
+        replyThreadRootCandidates: '.css-tpyajk, .Modal-content, [role="dialog"]',
+        replyThreadItems: '.css-34podr [data-id], .css-34podr .CommentItem',
+        replyNestedContainer: '.css-16zdamy',
+        commentUserLinks: '.UserLink, a[href*="/people/"], a[class*="Link"]'
+    };
+
+    const ANSWER_LOAD_WAIT_TIMEOUT = LIMITS.answerLoadWaitTimeout;
+    const COMMENT_PANEL_WAIT_TIMEOUT = LIMITS.commentPanelWaitTimeout;
+    const COMMENT_OPEN_WAIT_TIMEOUT = LIMITS.commentOpenWaitTimeout;
+    const WAIT_POLL_INTERVAL = LIMITS.waitPollInterval;
+    const STABLE_POLL_LIMIT = LIMITS.stablePollLimit;
+    const RETRY_SCROLL_BOTTOM_TIMES = LIMITS.retryScrollBottomTimes;
+    const MAX_NESTED_REPLY_THREADS_PER_ANSWER = LIMITS.maxNestedReplyThreadsPerAnswer;
+    const STOP_ERROR_MESSAGE = LABELS.stopErrorMessage;
     const __zudRunState = {
         requested: false,
         running: false,
@@ -58,10 +129,10 @@
         }
     });
 
-    // --- Variables for Selective Download ---
+    // --- State ---
     const selectedAnswers = new Set();
 
-    // --- Panel with Tokyo Night Light Theme ---
+    // --- Panel / UI ---
     function __zudInjectStyles() {
         if (document.getElementById('zud-style')) return;
         const css = `
@@ -212,14 +283,14 @@
 
             panel.querySelector('#zudExportLog').addEventListener('click', () => {
                 const text = __getLogText();
-                const title = document.querySelector('.QuestionHeader-title')?.innerText || '知乎日志';
+                const title = document.querySelector(SELECTORS.questionTitle)?.innerText || LABELS.defaultLogTitle;
                 const filename = `${sanitizeFilename(title)}_${formatDownloadDateTime()}.log`;
                 __downloadTextFile(filename, text, 'text/plain;charset=utf-8');
                 __trace('log', 'exported', { filename });
             });
 
             // Get actual answer count and set slider max
-            let headerText = document.querySelector('.List-headerText')?.innerText || '';
+            let headerText = document.querySelector(SELECTORS.answerListHeader)?.innerText || '';
             headerText = headerText.replace(',', '');
             const m = headerText.match(/(\d+)\s*个回答/);
             const total = m ? parseInt(m[1]) : 200;
@@ -278,7 +349,7 @@
                     const questionMd = getQuestionInfo();
                     const answersMd = await getTopNAnswersMarkdown(n);
                     const fullMd = questionMd + answersMd;
-                    const title = document.querySelector('.QuestionHeader-title')?.innerText || '知乎问题';
+                    const title = document.querySelector(SELECTORS.questionTitle)?.innerText || LABELS.defaultQuestionTitle;
                     const filename = `${sanitizeFilename(title)}_${formatDownloadDateTime()}_top${n}.md`;
                     downloadMarkdownFile(filename, fullMd);
                     __endOperation('done');
@@ -303,7 +374,7 @@
                     const questionMd = getQuestionInfo();
                     const answersMd = await getTopNAnswersMarkdownWithComments(n);
                     const fullMd = questionMd + answersMd;
-                    const title = document.querySelector('.QuestionHeader-title')?.innerText || '知乎问题';
+                    const title = document.querySelector(SELECTORS.questionTitle)?.innerText || LABELS.defaultQuestionTitle;
                     const filename = `${sanitizeFilename(title)}_${formatDownloadDateTime()}_top${n}_with_comments.md`;
                     downloadMarkdownFile(filename, fullMd);
                     __endOperation('done');
@@ -321,6 +392,8 @@
         }
         return panel;
     }
+
+    // --- Logging / Control ---
 
     // Console hook
     (function __zudHookConsole() {
@@ -350,7 +423,7 @@
         console.error = (...a) => { try { push('error', a); } catch (_) { } orig.error(...a); };
     })();
 
-    // Helper functions
+    // --- Shared Utilities ---
     function __parseZhihuCount(text) {
         const s = (text || '').toString().trim().replace(/\s+/g, '');
         const mWan = s.match(/([\d.]+)万/i);
@@ -819,22 +892,106 @@
         return md;
     }
 
+    function __collectAnswerExportData(answerEl) {
+        const authorEl = answerEl.querySelector(SELECTORS.answerAuthorLink);
+        const answerId = __getAnswerId(answerEl);
+        const contentHtml = answerEl.querySelector(SELECTORS.answerContent)?.innerHTML || '';
+
+        return {
+            answerId,
+            authorName: authorEl?.innerText || LABELS.anonymousUser,
+            authorUrl: authorEl?.href || '#',
+            upvoteCount: __getUpvoteCountFromAnswer(answerEl),
+            commentCount: __getCommentCountFromAnswer(answerEl),
+            time: __getAnswerTimeFromAnswer(answerEl),
+            contentMd: turndownService.turndown(contentHtml)
+        };
+    }
+
+    async function __buildAnswersMarkdown(answerElements, {
+        batchSize = 10,
+        includeComments = false,
+        shouldInclude = () => true,
+        headingBuilder = (count) => `## 回答 (${count})`,
+        onMissingComments = () => '',
+        onComplete = null
+    } = {}) {
+        const chunks = [];
+        let index = 0;
+        const exportedAnswerTokens = new Set();
+
+        for (let i = 0; i < answerElements.length; i += batchSize) {
+            const batch = answerElements.slice(i, i + batchSize);
+            for (const answerEl of batch) {
+                const answerData = __collectAnswerExportData(answerEl);
+                if (!shouldInclude(answerData)) continue;
+
+                index++;
+                if (answerData.answerId) {
+                    exportedAnswerTokens.add(answerData.answerId);
+                }
+
+                let commentsMd = '';
+                if (includeComments) {
+                    try {
+                        if (answerData.answerId) {
+                            __trace('answer', 'collect-comments:start', {
+                                index,
+                                answerId: answerData.answerId,
+                                commentCount: answerData.commentCount
+                            });
+                            const comments = await __fetchCommentsForAnswer(answerData.answerId);
+                            __trace('answer', 'collect-comments:done', {
+                                index,
+                                answerId: answerData.answerId,
+                                roots: comments.length
+                            });
+                            commentsMd = __commentsBlockMarkdown(comments);
+                        } else {
+                            commentsMd = onMissingComments(answerData);
+                        }
+                    } finally {
+                        __resetAnswerCommentUi(answerEl);
+                    }
+                }
+
+                chunks.push(__renderAnswerMarkdown({
+                    index,
+                    authorName: answerData.authorName,
+                    authorUrl: answerData.authorUrl,
+                    upvoteCount: answerData.upvoteCount,
+                    commentCount: answerData.commentCount,
+                    time: answerData.time,
+                    contentMd: answerData.contentMd,
+                    commentsMd
+                }));
+            }
+            await yieldToBrowser(0);
+        }
+
+        if (typeof onComplete === 'function') {
+            onComplete({ index, exportedAnswerTokens });
+        }
+
+        return `${headingBuilder(index)}\n\n${chunks.join('')}`;
+    }
+
     function getQuestionInfo() {
-        const title = document.querySelector('.QuestionHeader-title')?.innerText || 'No Title';
+        const title = document.querySelector(SELECTORS.questionTitle)?.innerText || LABELS.noTitle;
         const url = window.location.href;
-        const descriptionElement = document.querySelector('.QuestionRichText .RichText.ztext');
+        const descriptionElement = document.querySelector(SELECTORS.questionDescription);
         const descriptionHtml = descriptionElement?.innerHTML || '';
         const descriptionMd = turndownService.turndown(descriptionHtml);
-        const topics = Array.from(document.querySelectorAll('.QuestionHeader-topics .Tag-content a')).map(topic => topic.innerText);
-        const questionAuthorElement = document.querySelector('.QuestionAuthor .AuthorInfo-name a');
-        const author = questionAuthorElement?.innerText || 'Anonymous';
-        const followerCount = document.querySelector('.QuestionFollowStatus .NumberBoard-item:nth-child(1) .NumberBoard-itemValue')?.getAttribute('title') || 'N/A';
-        const viewCount = document.querySelector('.QuestionFollowStatus .NumberBoard-item:nth-child(2) .NumberBoard-itemValue')?.getAttribute('title') || 'N/A';
-        const answerCount = document.querySelector('.List-headerText span')?.innerText.match(/\d+/)?.[0] || 'N/A';
+        const topics = Array.from(document.querySelectorAll(SELECTORS.questionTopics)).map(topic => topic.innerText);
+        const questionAuthorElement = document.querySelector(SELECTORS.questionAuthor);
+        const author = questionAuthorElement?.innerText || LABELS.anonymousAuthor;
+        const followerCount = document.querySelector(SELECTORS.questionFollowerCount)?.getAttribute('title') || 'N/A';
+        const viewCount = document.querySelector(SELECTORS.questionViewCount)?.getAttribute('title') || 'N/A';
+        const answerCount = document.querySelector(SELECTORS.answerListHeaderCount)?.innerText.match(/\d+/)?.[0] || 'N/A';
         return __renderQuestionMarkdown({
             title,
             url,
-            author: author !== 'Anonymous' ? author : '匿名用户',
+            author: author !== LABELS.anonymousAuthor ? author : LABELS.anonymousUser,
             topics,
             followerCount,
             viewCount,
@@ -842,6 +999,8 @@
             descriptionMd
         });
     }
+
+    // --- Answer Loading / Export Flow ---
 
     // Load at least N answers
     async function loadAtLeastNAnswers(targetCount) {
@@ -852,7 +1011,7 @@
 
         for (let attempt = 0; attempt < maxAttempts; attempt++) {
             __throwIfStopRequested('answers', 'stop-during-load');
-            const answers = document.querySelectorAll('.AnswerItem');
+            const answers = document.querySelectorAll(SELECTORS.answerItem);
             const currentCount = answers.length;
 
             console.log(`Current: ${currentCount}/${targetCount}`);
@@ -867,7 +1026,7 @@
 
             // Wait for new content to load
             const growthResult = await __waitForGrowth(
-                () => document.querySelectorAll('.AnswerItem').length,
+                () => document.querySelectorAll(SELECTORS.answerItem).length,
                 { timeoutMs: ANSWER_LOAD_WAIT_TIMEOUT }
             );
             if (growthResult.cancelled) throw __createStopError();
@@ -892,76 +1051,24 @@
 
     // Get top N answers
     async function getTopNAnswersMarkdown(n) {
-        const answerElements = Array.from(document.querySelectorAll('.AnswerItem')).slice(0, n);
-        let md = `## 前 ${n} 条回答\n\n`;
-
-        for (let i = 0; i < answerElements.length; i++) {
-            const answerEl = answerElements[i];
-            const authorEl = answerEl.querySelector('.AuthorInfo-name a');
-            const authorName = authorEl?.innerText || '匿名用户';
-            const authorUrl = authorEl?.href || '#';
-            const upvoteCount = __getUpvoteCountFromAnswer(answerEl);
-            const commentCount = __getCommentCountFromAnswer(answerEl);
-            const time = __getAnswerTimeFromAnswer(answerEl);
-            const contentHtml = answerEl.querySelector('.RichText.ztext')?.innerHTML || '';
-            const contentMd = turndownService.turndown(contentHtml);
-
-            md += __renderAnswerMarkdown({
-                index: i + 1,
-                authorName,
-                authorUrl,
-                upvoteCount,
-                commentCount,
-                time,
-                contentMd
-            });
-
-            await yieldToBrowser(0);
-        }
-
-        return md;
+        const answerElements = Array.from(document.querySelectorAll(SELECTORS.answerItem)).slice(0, n);
+        return __buildAnswersMarkdown(answerElements, {
+            batchSize: 1,
+            headingBuilder: () => `## 前 ${n} 条回答`
+        });
     }
 
     // Get top N answers with comments
     async function getTopNAnswersMarkdownWithComments(n) {
-        const answerElements = Array.from(document.querySelectorAll('.AnswerItem')).slice(0, n);
-        let md = `## 前 ${n} 条回答（含评论）\n\n`;
-
-        for (let i = 0; i < answerElements.length; i++) {
-            const answerEl = answerElements[i];
-            const authorEl = answerEl.querySelector('.AuthorInfo-name a');
-            const authorName = authorEl?.innerText || '匿名用户';
-            const authorUrl = authorEl?.href || '#';
-            const upvoteCount = __getUpvoteCountFromAnswer(answerEl);
-            const commentCount = __getCommentCountFromAnswer(answerEl);
-            const time = __getAnswerTimeFromAnswer(answerEl);
-            const contentHtml = answerEl.querySelector('.RichText.ztext')?.innerHTML || '';
-            const contentMd = turndownService.turndown(contentHtml);
-
-            const answerId = __getAnswerId(answerEl);
-            let commentsMd = '';
-            if (answerId) {
-                __trace('answer', 'collect-comments:start', { index: i + 1, answerId, commentCount });
-                const comments = await __fetchCommentsForAnswer(answerId);
-                __trace('answer', 'collect-comments:done', { index: i + 1, answerId, roots: comments.length });
-                commentsMd = __commentsBlockMarkdown(comments);
-            }
-            closeCommentModal(); // 确保关闭弹窗
-            md += __renderAnswerMarkdown({
-                index: i + 1,
-                authorName,
-                authorUrl,
-                upvoteCount,
-                commentCount,
-                time,
-                contentMd,
-                commentsMd
-            });
-            await yieldToBrowser(0);
-        }
-
-        return md;
+        const answerElements = Array.from(document.querySelectorAll(SELECTORS.answerItem)).slice(0, n);
+        return __buildAnswersMarkdown(answerElements, {
+            batchSize: 1,
+            includeComments: true,
+            headingBuilder: () => `## 前 ${n} 条回答（含评论）`
+        });
     }
+
+    // --- Comment Discovery / Extraction ---
 
     // Comment fetching functions with better error handling
     async function __fetchCommentsForAnswer_old(answerId) {
@@ -1087,9 +1194,7 @@
                     const commentsList = __findCommentListContainer(commentsRoot) || commentsRoot;
                     const comments = __extractCommentsFromPopup(commentsList);
                     await __collectNestedReplies(commentsRoot, comments);
-                    __collapseAnswerComments(answerEl);
                     __trace('comments', 'full-root-extracted', { answerId, roots: comments.length });
-                    closeCommentModal();
                     return comments;
                 }
             } else {
@@ -1098,7 +1203,6 @@
                 const embeddedComments = __findCommentListContainer(answerEl);
                 if (embeddedComments) {
                     const comments = __extractCommentsFromPopup(embeddedComments);
-                    __collapseAnswerComments(answerEl);
                     __trace('comments', 'inline-extracted', { answerId, roots: comments.length });
                     return comments;
                 }
@@ -1110,8 +1214,9 @@
                 throw e;
             }
             console.warn('Failed to get comments:', e);
-            closeCommentModal();
             return [];
+        } finally {
+            __resetAnswerCommentUi(answerEl);
         }
     }
 
@@ -1121,12 +1226,11 @@
 
     function __findViewAllCommentsTrigger(root) {
         if (!root?.querySelectorAll) return null;
-        const explicit = root.querySelector('.css-vurnku');
+        const explicit = root.querySelector(SELECTORS.exactViewAllTrigger);
         if (explicit && /^(点击)?查看全部评论$/.test((explicit.textContent || '').replace(/\s+/g, ' ').trim())) {
             return explicit;
         }
-        const exactSelectors = ['.css-vurnku', 'button', '[role="button"]', 'div', 'span'];
-        const candidates = root.querySelectorAll(exactSelectors.join(', '));
+        const candidates = root.querySelectorAll(SELECTORS.globalCommentTriggerCandidates);
         for (const el of candidates) {
             const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
             if (/^(点击)?查看全部评论$/.test(text) || /^查看全部评论$/.test(text)) return el;
@@ -1136,7 +1240,7 @@
 
     function __snapshotGlobalCommentTriggers(answerEl) {
         const searchRoot = __getAnswerSearchRoot(answerEl);
-        const candidates = document.querySelectorAll('.css-vurnku, button, [role="button"], div, span');
+        const candidates = document.querySelectorAll(SELECTORS.globalCommentTriggerCandidates);
         const snapshot = new Set();
         for (const el of candidates) {
             if (!el?.textContent) continue;
@@ -1153,14 +1257,14 @@
 
     function __findFreshGlobalCommentsTrigger(answerEl, baseline = null) {
         const searchRoot = __getAnswerSearchRoot(answerEl);
-        const explicit = document.querySelector('.css-vurnku');
+        const explicit = document.querySelector(SELECTORS.exactViewAllTrigger);
         if (explicit && !searchRoot.contains(explicit) && !baseline?.has(explicit)) {
             const text = (explicit.textContent || '').replace(/\s+/g, ' ').trim();
             if (/^(点击)?查看全部评论$/.test(text) || /^查看全部评论$/.test(text)) {
                 return explicit;
             }
         }
-        const candidates = document.querySelectorAll('.css-vurnku, button, [role="button"], div, span');
+        const candidates = document.querySelectorAll(SELECTORS.globalCommentTriggerCandidates);
         for (const el of candidates) {
             if (!el?.textContent) continue;
             if (el.hidden) continue;
@@ -1177,14 +1281,14 @@
 
     function __findSingleVisibleGlobalCommentsTrigger(answerEl) {
         const searchRoot = __getAnswerSearchRoot(answerEl);
-        const explicit = document.querySelector('.css-vurnku');
+        const explicit = document.querySelector(SELECTORS.exactViewAllTrigger);
         if (explicit && !searchRoot.contains(explicit) && !explicit.hidden && !explicit.closest('[hidden]')) {
             const text = (explicit.textContent || '').replace(/\s+/g, ' ').trim();
             if (/^(点击)?查看全部评论$/.test(text) || /^查看全部评论$/.test(text)) {
                 return explicit;
             }
         }
-        const candidates = Array.from(document.querySelectorAll('.css-vurnku, button, [role="button"], div, span'))
+        const candidates = Array.from(document.querySelectorAll(SELECTORS.globalCommentTriggerCandidates))
             .filter(el => {
                 if (!el?.textContent) return false;
                 if (el.hidden) return false;
@@ -1199,11 +1303,11 @@
 
     function __findReplyThreadRoot(root) {
         if (!root?.querySelectorAll) return null;
-        const candidates = Array.from(root.querySelectorAll('.css-tpyajk, .Modal-content, [role="dialog"]'));
+        const candidates = Array.from(root.querySelectorAll(SELECTORS.replyThreadRootCandidates));
         return candidates.find(el =>
             /评论回复/.test((el.textContent || '').replace(/\s+/g, ' ').trim())
-            && !!el.querySelector('.css-16zdamy')
-            && !!el.querySelector('.css-34podr [data-id], .css-34podr .CommentItem')
+            && !!el.querySelector(SELECTORS.replyNestedContainer)
+            && !!el.querySelector(SELECTORS.replyThreadItems)
         ) || null;
     }
 
@@ -1214,7 +1318,7 @@
 
         while (node.parentElement) {
             const parent = node.parentElement;
-            const answerCount = parent.querySelectorAll('.AnswerItem').length;
+            const answerCount = parent.querySelectorAll(SELECTORS.answerItem).length;
             if (answerCount > 1) break;
             best = parent;
             node = parent;
@@ -1226,7 +1330,7 @@
     function __findBetweenAnswerAndNextAnswer(answerEl, selector) {
         if (!answerEl || !selector) return null;
         const searchRoot = __getAnswerSearchRoot(answerEl);
-        const answers = Array.from(document.querySelectorAll('.AnswerItem'));
+        const answers = Array.from(document.querySelectorAll(SELECTORS.answerItem));
         const currentIndex = answers.indexOf(answerEl);
         const nextAnswer = currentIndex >= 0 ? answers[currentIndex + 1] : null;
         const candidates = Array.from(document.querySelectorAll(selector));
@@ -1243,7 +1347,7 @@
     function __findBetweenAnswerAndNextAnswer(answerEl, selector) {
         if (!answerEl || !selector) return null;
         const searchRoot = __getAnswerSearchRoot(answerEl);
-        const answers = Array.from(document.querySelectorAll('.AnswerItem'));
+        const answers = Array.from(document.querySelectorAll(SELECTORS.answerItem));
         const currentIndex = answers.indexOf(answerEl);
         const nextAnswer = currentIndex >= 0 ? answers[currentIndex + 1] : null;
         const candidates = Array.from(document.querySelectorAll(selector));
@@ -1259,14 +1363,14 @@
 
     function __snapshotGlobalCommentsRoots(answerEl) {
         const searchRoot = __getAnswerSearchRoot(answerEl);
-        const candidates = document.querySelectorAll('.css-tpyajk, [role="dialog"] .Modal-content, .Modal-content, [role="dialog"], .css-u76jt1, .css-840pn3, .css-18ld3w0');
+        const candidates = document.querySelectorAll(SELECTORS.globalCommentRootCandidates);
         const snapshot = new Map();
         for (const el of candidates) {
             if (!el?.querySelector) continue;
             if (el.hidden) continue;
             if (el.closest('[hidden]')) continue;
             if (searchRoot.contains(el)) continue;
-            const count = el.querySelectorAll('[data-id], .CommentItem').length;
+            const count = el.querySelectorAll(SELECTORS.commentItems).length;
             if (count > 0) snapshot.set(el, count);
         }
         return snapshot;
@@ -1274,7 +1378,7 @@
 
     function __findFreshGlobalCommentsRoot(answerEl, baseline = null) {
         const searchRoot = __getAnswerSearchRoot(answerEl);
-        const candidates = document.querySelectorAll('.css-tpyajk, [role="dialog"] .Modal-content, .Modal-content, [role="dialog"], .css-u76jt1, .css-840pn3, .css-18ld3w0');
+        const candidates = document.querySelectorAll(SELECTORS.globalCommentRootCandidates);
         let best = null;
         let bestCount = 0;
         let bestRank = -1;
@@ -1283,7 +1387,7 @@
             if (el.hidden) continue;
             if (el.closest('[hidden]')) continue;
             if (searchRoot.contains(el)) continue;
-            const count = el.querySelectorAll('[data-id], .CommentItem').length;
+            const count = el.querySelectorAll(SELECTORS.commentItems).length;
             if (count === 0) continue;
             const previous = baseline?.get(el) || 0;
             const rank = __commentsRootRank(el);
@@ -1308,22 +1412,12 @@
 
     function __findAnswerScopedCommentsRoot(root) {
         if (!root?.querySelector) return null;
-        const candidates = [
-            '.css-tpyajk',
-            '.css-u76jt1',
-            '.css-840pn3',
-            '.css-18ld3w0',
-            '[role="dialog"] .Modal-content',
-            '.Modal-content',
-            '[role="dialog"]'
-        ];
-
-        for (const selector of candidates) {
+        for (const selector of SELECTORS.scopedCommentRootCandidates) {
             const el = root.querySelector(selector);
-            if (el && el.querySelector('[data-id], .CommentItem')) return el;
+            if (el && el.querySelector(SELECTORS.commentItems)) return el;
         }
 
-        return root.querySelector('[data-id], .CommentItem') ? root : null;
+        return root.querySelector(SELECTORS.commentItems) ? root : null;
     }
 
     function __findExpandedCommentsRoot(root) {
@@ -1342,13 +1436,18 @@
         }
     }
 
+    function __resetAnswerCommentUi(answerEl) {
+        __collapseAnswerComments(answerEl);
+        closeCommentModal();
+    }
+
     function __pickExpandedCommentsRoot(answerEl) {
         return __findAnswerScopedCommentsRoot(answerEl);
     }
 
     function __isCompleteCommentsRoot(root) {
         if (!root?.querySelector) return false;
-        const itemCount = root.querySelectorAll('[data-id], .CommentItem').length;
+        const itemCount = root.querySelectorAll(SELECTORS.commentItems).length;
         if (itemCount === 0) return false;
         const pendingTrigger = __findViewAllCommentsTrigger(root);
         return !pendingTrigger;
@@ -1426,7 +1525,7 @@
 
     function __findCommentScrollContainer(root) {
         if (!root?.querySelectorAll) return null;
-        const explicit = root.querySelector('.css-840pn3, .css-34podr, [class*="scroll"]');
+        const explicit = root.querySelector(SELECTORS.commentScrollCandidates);
         if (explicit) return explicit;
         const candidates = [root, ...root.querySelectorAll('*')];
         for (const el of candidates) {
@@ -1438,12 +1537,10 @@
     function __findCommentListContainer(root) {
         if (!root?.querySelector) return null;
 
-        const explicit = root.querySelector(
-            '.Comments-container, .CommentsV2, .CommentsV2-list, .CommentListV2, [class*="Comments"]'
-        );
+        const explicit = root.querySelector(SELECTORS.commentListCandidates);
         if (explicit) return explicit;
 
-        const firstComment = root.querySelector('.CommentItem, [data-id][class*="Comment"], [data-id]');
+        const firstComment = root.querySelector(SELECTORS.commentItems);
         return firstComment?.parentElement || null;
     }
 
@@ -1461,7 +1558,7 @@
         } = options;
 
         let lastHeight = scrollContainer.scrollHeight;
-        let lastCount = commentsRoot.querySelectorAll('[data-id], .CommentItem').length;
+        let lastCount = commentsRoot.querySelectorAll(SELECTORS.commentItems).length;
         let stablePolls = 0;
         const startedAt = Date.now();
 
@@ -1472,7 +1569,7 @@
             await __sleep(intervalMs);
 
             const nextHeight = scrollContainer.scrollHeight;
-            const nextCount = commentsRoot.querySelectorAll('[data-id], .CommentItem').length;
+            const nextCount = commentsRoot.querySelectorAll(SELECTORS.commentItems).length;
             const changed = nextHeight > lastHeight || nextCount > lastCount;
 
             if (changed) {
@@ -1488,7 +1585,7 @@
         return {
             changed: false,
             height: scrollContainer.scrollHeight,
-            count: commentsRoot.querySelectorAll('[data-id], .CommentItem').length,
+            count: commentsRoot.querySelectorAll(SELECTORS.commentItems).length,
             cancelled: false
         };
     }
@@ -1518,7 +1615,7 @@
     }
 
     function __getCommentUserTexts(item) {
-        const links = Array.from(item.querySelectorAll('.UserLink, a[href*="/people/"], a[class*="Link"]'));
+        const links = Array.from(item.querySelectorAll(SELECTORS.commentUserLinks));
         return links
             .map(link => (link.textContent || '').replace(/\s+/g, ' ').trim())
             .filter(Boolean);
@@ -1587,7 +1684,7 @@
             }
         }
 
-        const commentItems = commentsList.querySelectorAll('.CommentItem, [data-id][class*="Comment"], [data-id]');
+        const commentItems = commentsList.querySelectorAll(SELECTORS.commentItems);
         commentItems.forEach(item => {
             const comment = __extractSingleCommentItem(item);
             if (comment) comments.push(comment);
@@ -1598,6 +1695,12 @@
     function __isReplyExpansionButton(button) {
         const text = (button?.textContent || '').replace(/\s+/g, ' ').trim();
         return /(查看全部|展开其他).*(条)?回复/.test(text);
+    }
+
+    function __getReplyTargetCountFromButton(button) {
+        const text = (button?.textContent || '').replace(/\s+/g, ' ').trim();
+        const match = text.match(/(\d+)\s*条回复/);
+        return match ? Number(match[1]) : 0;
     }
 
     function __findReplyModalBackControl(root) {
@@ -1673,6 +1776,39 @@
                         await __sleep(COMMENT_OPEN_WAIT_TIMEOUT);
                     }
                     nestedRoot = nestedRoot || __findExpandedCommentsRoot(containerRoot) || containerRoot;
+                    const replyTargetCount = __getReplyTargetCountFromButton(button);
+                    const nestedReplyContainer = nestedRoot.querySelector('.css-16zdamy');
+                    const nestedScrollContainer = __findCommentScrollContainer(nestedRoot);
+                    if (replyTargetCount > 0 && nestedReplyContainer && nestedScrollContainer) {
+                        let stablePasses = 0;
+                        let lastCount = nestedReplyContainer.querySelectorAll('[data-id], .CommentItem').length;
+                        const maxReplyPasses = Math.max(RETRY_SCROLL_BOTTOM_TIMES * 4, 20);
+
+                        for (let j = 0; j < maxReplyPasses; j++) {
+                            await humanLikeScrollContainerToBottom(nestedScrollContainer);
+                            const progress = await __waitForCommentPanelProgress(
+                                nestedReplyContainer,
+                                nestedScrollContainer,
+                                { timeoutMs: COMMENT_PANEL_WAIT_TIMEOUT, stablePollLimit: 3 }
+                            );
+                            if (progress.cancelled) throw __createStopError();
+                            __trace('replies', 'scroll-thread', {
+                                ownerId,
+                                pass: j + 1,
+                                count: progress.count,
+                                targetCount: replyTargetCount,
+                                changed: progress.changed
+                            });
+                            if (progress.count >= replyTargetCount) break;
+                            if (!progress.changed && progress.count === lastCount) {
+                                stablePasses++;
+                                if (stablePasses >= 3) break;
+                            } else {
+                                stablePasses = 0;
+                            }
+                            lastCount = progress.count;
+                        }
+                    }
                     const nestedComments = __extractCommentsFromPopup(nestedRoot);
                     if (nestedComments[0]?.child_comments_full?.length) {
                         rootMap.get(ownerId).child_comments_full = nestedComments[0].child_comments_full;
@@ -1701,9 +1837,7 @@
     }
 
     function closeCommentModal() {
-        const closeBtn = document.querySelector(
-            '[role="dialog"] button[aria-label="关闭"], button[aria-label="关闭"], button:has(.Zi--Close)'
-        );
+        const closeBtn = document.querySelector(SELECTORS.commentModalClose);
         if (closeBtn) {
             closeBtn.click();
         } else {
@@ -1822,7 +1956,7 @@
     //     return roots;
     // }
 
-    // 在 __commentsBlockMarkdown 函数之前添加：
+    // --- Markdown Rendering ---
 
     function __commentToMarkdown(comment, level = 0) {
         const author = comment.author?.name || '匿名用户';
@@ -1916,13 +2050,13 @@
     async function expandCollapsedContent() {
         console.log("Expanding collapsed content...");
         let expandedCount = 0;
-        const questionMoreButton = document.querySelector('.QuestionRichText-more');
+        const questionMoreButton = document.querySelector(SELECTORS.questionMoreButton);
         if (questionMoreButton && questionMoreButton.offsetParent !== null && questionMoreButton.innerText.includes('显示全部')) {
             questionMoreButton.click();
             expandedCount++;
             await __sleep(150);
         }
-        const buttons = document.querySelectorAll('.RichContent-collapsedText.Button--plain');
+        const buttons = document.querySelectorAll(SELECTORS.collapsedContentButtons);
         for (const button of buttons) {
             if (button.offsetParent !== null) {
                 button.click();
@@ -1936,7 +2070,7 @@
 
     // Load all answers
     async function loadAllAnswers() {
-        const headerSpan = document.querySelector('.List-headerText span');
+        const headerSpan = document.querySelector(SELECTORS.answerListHeaderCount);
         let headerText = headerSpan?.innerText || '';
         headerText = headerText.replace(',', '');
         const totalAnswers = parseInt(headerText.match(/\d+/)?.[0]) || 999999;
@@ -1947,7 +2081,7 @@
 
         for (let attempt = 0; attempt < maxAttempts; attempt++) {
             __throwIfStopRequested('answers', 'stop-during-load-all');
-            const answers = document.querySelectorAll('.AnswerItem');
+            const answers = document.querySelectorAll(SELECTORS.answerItem);
             const now = answers.length;
             if (now >= totalAnswers) {
                 console.log(`Reached total answers ${now}/${totalAnswers}.`);
@@ -1955,7 +2089,7 @@
             }
             await __nudgeAnswerLoading();
             const growthResult = await __waitForGrowth(
-                () => document.querySelectorAll('.AnswerItem').length,
+                () => document.querySelectorAll(SELECTORS.answerItem).length,
                 { timeoutMs: ANSWER_LOAD_WAIT_TIMEOUT }
             );
             if (growthResult.cancelled) throw __createStopError();
@@ -1977,126 +2111,36 @@
 
     // Get all answers markdown
     async function getAllAnswersMarkdown(batchSize = 10) {
-        const answerElements = Array.from(document.querySelectorAll('.AnswerItem'));
-        const chunks = [];
-        let index = 0;
-
-        for (let i = 0; i < answerElements.length; i += batchSize) {
-            const batch = answerElements.slice(i, i + batchSize);
-            for (const answerEl of batch) {
-                index++;
-                const authorEl = answerEl.querySelector('.AuthorInfo-name a');
-                const authorName = authorEl?.innerText || '匿名用户';
-                const authorUrl = authorEl?.href || '#';
-                const upvoteCount = __getUpvoteCountFromAnswer(answerEl);
-                const commentCount = __getCommentCountFromAnswer(answerEl);
-                const time = __getAnswerTimeFromAnswer(answerEl);
-                const contentHtml = answerEl.querySelector('.RichText.ztext')?.innerHTML || '';
-                const contentMd = turndownService.turndown(contentHtml);
-
-                chunks.push(__renderAnswerMarkdown({
-                    index,
-                    authorName,
-                    authorUrl,
-                    upvoteCount,
-                    commentCount,
-                    time,
-                    contentMd
-                }));
-            }
-            await yieldToBrowser(0);
-        }
-
-        let fullMd = `## 全部回答 (${index})\n\n`;
-        fullMd += chunks.join('');
-        return fullMd;
+        const answerElements = Array.from(document.querySelectorAll(SELECTORS.answerItem));
+        return __buildAnswersMarkdown(answerElements, {
+            batchSize,
+            headingBuilder: (count) => `## 全部回答 (${count})`
+        });
     }
 
     // Get all answers with comments
     async function getAllAnswersMarkdownWithComments(batchSize = 8) {
-        const answerElements = Array.from(document.querySelectorAll('.AnswerItem'));
-        const chunks = [];
-        let index = 0;
-        for (let i = 0; i < answerElements.length; i += batchSize) {
-            const batch = answerElements.slice(i, i + batchSize);
-            for (const answerEl of batch) {
-                index++;
-                const authorEl = answerEl.querySelector('.AuthorInfo-name a');
-                const authorName = authorEl?.innerText || '匿名用户';
-                const authorUrl = authorEl?.href || '#';
-                const upvoteCount = __getUpvoteCountFromAnswer(answerEl);
-                const commentCount = __getCommentCountFromAnswer(answerEl);
-                const time = __getAnswerTimeFromAnswer(answerEl);
-                const contentHtml = answerEl.querySelector('.RichText.ztext')?.innerHTML || '';
-                const contentMd = turndownService.turndown(contentHtml);
-
-                const answerId = __getAnswerId(answerEl);
-                let commentsMd = '';
-                if (answerId) {
-                    const comments = await __fetchCommentsForAnswer(answerId);
-                    commentsMd = __commentsBlockMarkdown(comments);
-                    closeCommentModal(); // 确保关闭弹窗
-                } else {
-                    commentsMd = '_（未能识别回答 ID，评论跳过）_';
-                }
-                chunks.push(__renderAnswerMarkdown({
-                    index,
-                    authorName,
-                    authorUrl,
-                    upvoteCount,
-                    commentCount,
-                    time,
-                    contentMd,
-                    commentsMd
-                }));
-            }
-            await yieldToBrowser(0);
-        }
-        let fullMd = `## 全部回答 (${index})\n\n`;
-        fullMd += chunks.join('');
-        return fullMd;
+        const answerElements = Array.from(document.querySelectorAll(SELECTORS.answerItem));
+        return __buildAnswersMarkdown(answerElements, {
+            batchSize,
+            includeComments: true,
+            headingBuilder: (count) => `## 全部回答 (${count})`,
+            onMissingComments: () => '_（未能识别回答 ID，评论跳过）_'
+        });
     }
 
     // Get selected answers markdown
     async function getSelectedAnswersMarkdown(batchSize = 10) {
         const answerElements = Array.from(document.querySelectorAll('.AnswerItem'));
-        const chunks = [];
-        let selectedIndex = 0;
-        const exportedAnswerTokens = new Set();
-
-        for (let i = 0; i < answerElements.length; i += batchSize) {
-            const batch = answerElements.slice(i, i + batchSize);
-            for (const answerEl of batch) {
-                const answerToken = answerEl.getAttribute('name') || answerEl.dataset.zop?.itemId || answerEl.id;
-                if (answerToken && selectedAnswers.has(answerToken)) {
-                    selectedIndex++;
-                    exportedAnswerTokens.add(answerToken);
-
-                    const authorEl = answerEl.querySelector('.AuthorInfo-name a');
-                    const authorName = authorEl?.innerText || '匿名用户';
-                    const authorUrl = authorEl?.href || '#';
-                    const upvoteCount = __getUpvoteCountFromAnswer(answerEl);
-                    const commentCount = __getCommentCountFromAnswer(answerEl);
-                    const time = __getAnswerTimeFromAnswer(answerEl);
-                    const contentHtml = answerEl.querySelector('.RichText.ztext')?.innerHTML || '';
-                    const contentMd = turndownService.turndown(contentHtml);
-
-                    chunks.push(__renderAnswerMarkdown({
-                        index: selectedIndex,
-                        authorName,
-                        authorUrl,
-                        upvoteCount,
-                        commentCount,
-                        time,
-                        contentMd
-                    }));
-                }
+        let exportedAnswerTokens = new Set();
+        const fullMd = await __buildAnswersMarkdown(answerElements, {
+            batchSize,
+            shouldInclude: ({ answerId }) => !!answerId && selectedAnswers.has(answerId),
+            headingBuilder: (count) => `## 已选回答 (${count}/${selectedAnswers.size})`,
+            onComplete: ({ exportedAnswerTokens: exported }) => {
+                exportedAnswerTokens = exported;
             }
-            await yieldToBrowser(0);
-        }
-
-        let fullMd = `## 已选回答 (${selectedIndex}/${selectedAnswers.size})\n\n`;
-        fullMd += chunks.join('');
+        });
 
         if (exportedAnswerTokens.size !== selectedAnswers.size) {
             console.warn(`Expected to export ${selectedAnswers.size} answers, but found only ${exportedAnswerTokens.size} in the DOM.`);
@@ -2108,41 +2152,12 @@
     // Get selected answers with comments
     async function getSelectedAnswersMarkdownWithComments(batchSize = 8) {
         const answerElements = Array.from(document.querySelectorAll('.AnswerItem'));
-        const chunks = [];
-        let selectedIndex = 0;
-        for (let i = 0; i < answerElements.length; i += batchSize) {
-            const batch = answerElements.slice(i, i + batchSize);
-            for (const answerEl of batch) {
-                const token = __getAnswerId(answerEl);
-                if (!token || !selectedAnswers.has(token)) continue;
-                selectedIndex++;
-                const authorEl = answerEl.querySelector('.AuthorInfo-name a');
-                const authorName = authorEl?.innerText || '匿名用户';
-                const authorUrl = authorEl?.href || '#';
-                const upvoteCount = __getUpvoteCountFromAnswer(answerEl);
-                const commentCount = __getCommentCountFromAnswer(answerEl);
-                const time = __getAnswerTimeFromAnswer(answerEl);
-                const contentHtml = answerEl.querySelector('.RichText.ztext')?.innerHTML || '';
-                const contentMd = turndownService.turndown(contentHtml);
-
-                const comments = await __fetchCommentsForAnswer(token);
-                chunks.push(__renderAnswerMarkdown({
-                    index: selectedIndex,
-                    authorName,
-                    authorUrl,
-                    upvoteCount,
-                    commentCount,
-                    time,
-                    contentMd,
-                    commentsMd: __commentsBlockMarkdown(comments)
-                }));
-                closeCommentModal(); // 确保关闭弹窗
-            }
-            await yieldToBrowser(0);
-        }
-        let fullMd = `## 已选回答 (${selectedIndex}/${selectedAnswers.size})\n\n`;
-        fullMd += chunks.join('');
-        return fullMd;
+        return __buildAnswersMarkdown(answerElements, {
+            batchSize,
+            includeComments: true,
+            shouldInclude: ({ answerId }) => !!answerId && selectedAnswers.has(answerId),
+            headingBuilder: (count) => `## 已选回答 (${count}/${selectedAnswers.size})`
+        });
     }
 
     // Update download button count
@@ -2166,7 +2181,7 @@
             return;
         }
 
-        const answerToken = answerElement.getAttribute('name') || answerElement.dataset.zop?.itemId || answerElement.id;
+        const answerToken = __getAnswerId(answerElement);
         if (!answerToken) {
             console.warn("Could not find token for answer, skipping select button:", answerElement);
             return;
@@ -2223,7 +2238,7 @@
     // Add select buttons to all answers
     function addSelectButtonsToAllAnswers() {
         console.log("Adding select buttons to initial answers...");
-        const answerElements = document.querySelectorAll('.AnswerItem');
+        const answerElements = document.querySelectorAll(SELECTORS.answerItem);
         answerElements.forEach(addSelectButton);
         console.log(`Added select buttons to ${answerElements.length} initial answers.`);
         updateDownloadButtonCount();
@@ -2256,7 +2271,7 @@
                 const questionMd = getQuestionInfo();
                 const answersMd = await getAllAnswersMarkdown();
                 const fullMarkdown = questionMd + answersMd;
-                const questionTitle = document.querySelector('.QuestionHeader-title')?.innerText || '知乎问题';
+                const questionTitle = document.querySelector(SELECTORS.questionTitle)?.innerText || LABELS.defaultQuestionTitle;
                 const filename = `${sanitizeFilename(questionTitle)}_${formatDownloadDateTime()}_all.md`;
                 downloadMarkdownFile(filename, fullMarkdown);
                 button.innerText = '下载完成!';
@@ -2301,7 +2316,7 @@
                 const questionMd = getQuestionInfo();
                 const answersMd = await getAllAnswersMarkdownWithComments();
                 const fullMd = questionMd + answersMd;
-                const questionTitle = document.querySelector('.QuestionHeader-title')?.innerText || '知乎问题';
+                const questionTitle = document.querySelector(SELECTORS.questionTitle)?.innerText || LABELS.defaultQuestionTitle;
                 const filename = `${sanitizeFilename(questionTitle)}_${formatDownloadDateTime()}_all_with_comments.md`;
                 downloadMarkdownFile(filename, fullMd);
                 button.innerText = '下载完成!';
@@ -2353,7 +2368,7 @@
                 const questionMd = getQuestionInfo();
                 const answersMd = await getSelectedAnswersMarkdown();
                 const fullMarkdown = questionMd + answersMd;
-                const questionTitle = document.querySelector('.QuestionHeader-title')?.innerText || '知乎问题';
+                const questionTitle = document.querySelector(SELECTORS.questionTitle)?.innerText || LABELS.defaultQuestionTitle;
                 const filename = `${sanitizeFilename(questionTitle)}_${formatDownloadDateTime()}_selected.md`;
                 downloadMarkdownFile(filename, fullMarkdown);
                 button.innerText = '下载完成!';
@@ -2402,7 +2417,7 @@
                 const questionMd = getQuestionInfo();
                 const answersMd = await getSelectedAnswersMarkdownWithComments();
                 const fullMd = questionMd + answersMd;
-                const questionTitle = document.querySelector('.QuestionHeader-title')?.innerText || '知乎问题';
+                const questionTitle = document.querySelector(SELECTORS.questionTitle)?.innerText || LABELS.defaultQuestionTitle;
                 const filename = `${sanitizeFilename(questionTitle)}_${formatDownloadDateTime()}_selected_with_comments.md`;
                 downloadMarkdownFile(filename, fullMd);
                 button.innerText = '下载完成!';
@@ -2425,6 +2440,8 @@
         });
         (__zudEnsurePanel().querySelector('#zud-btns') || document.body).appendChild(button);
     }
+
+    // --- Observers / Init ---
 
     // MutationObserver Setup
     const observer2 = new MutationObserver((mutations) => {

@@ -16,7 +16,24 @@ function loadZhihuTestApi(html = '<!doctype html><html><head></head><body></body
 
     const { window } = dom;
     window.scrollTo = () => { };
-    window.URL.createObjectURL = () => 'blob:test';
+
+    if (!Object.getOwnPropertyDescriptor(window.HTMLElement.prototype, 'innerText')) {
+        Object.defineProperty(window.HTMLElement.prototype, 'innerText', {
+            get() {
+                return this.textContent || '';
+            },
+            set(value) {
+                this.textContent = value;
+            },
+            configurable: true
+        });
+    }
+
+    const downloads = [];
+    window.URL.createObjectURL = (blob) => {
+        downloads.push(blob);
+        return 'blob:test';
+    };
     window.URL.revokeObjectURL = () => { };
 
     class FakeTurndownService {
@@ -101,6 +118,7 @@ function loadZhihuTestApi(html = '<!doctype html><html><head></head><body></body
             __findSingleVisibleGlobalCommentsTrigger,
             __findBetweenAnswerAndNextAnswer,
             __findReplyThreadRoot,
+            __getReplyTargetCountFromButton,
             __isCompleteCommentsRoot,
             __waitForCommentsModalReady,
             __pickExpandedCommentsRoot,
@@ -116,7 +134,13 @@ function loadZhihuTestApi(html = '<!doctype html><html><head></head><body></body
             __getLogText,
             __renderQuestionMarkdown,
             __renderAnswerMarkdown,
-            __fetchCommentsForAnswer
+            __fetchCommentsForAnswer,
+            getTopNAnswersMarkdown,
+            getTopNAnswersMarkdownWithComments,
+            getAllAnswersMarkdown,
+            getAllAnswersMarkdownWithComments,
+            getSelectedAnswersMarkdown,
+            getSelectedAnswersMarkdownWithComments
         };
 })();`
     );
@@ -125,8 +149,178 @@ function loadZhihuTestApi(html = '<!doctype html><html><head></head><body></body
 
     return {
         window,
+        downloads,
         api: window.__zudTestExports
     };
+}
+
+async function waitForCondition(predicate, { timeoutMs = 3000, intervalMs = 10 } = {}) {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+        const result = await predicate();
+        if (result) return result;
+        await new Promise(resolve => setTimeout(resolve, intervalMs));
+    }
+    throw new Error('Timed out waiting for condition');
+}
+
+async function readBlobText(blob) {
+    if (!blob) return '';
+    if (typeof blob.text === 'function') {
+        return blob.text();
+    }
+    const buffer = await blob.arrayBuffer();
+    return new TextDecoder().decode(buffer);
+}
+
+function buildAnswerMarkup({
+    id,
+    authorName,
+    authorUrl = `https://www.zhihu.com/people/${id}`,
+    commentCount = '0',
+    upvoteCount = '0',
+    time = '2026-03-25 12:00',
+    content = '回答内容'
+}) {
+    return `
+        <div class="AnswerItem" name="${id}">
+          <div class="ContentItem-meta"></div>
+          <div class="AuthorInfo-name">
+            <a href="${authorUrl}">${authorName}</a>
+          </div>
+          <button type="button" aria-label="赞同 ${upvoteCount}">${upvoteCount}</button>
+          <div class="ContentItem-actions">
+            <button type="button" class="comment-button">
+              <span class="Zi Zi--Comment"></span>
+              ${commentCount} 条评论
+            </button>
+          </div>
+          <time>${time}</time>
+          <div class="RichText ztext">${content}</div>
+        </div>
+    `;
+}
+
+function buildCommentMarkup({
+    id,
+    authorName,
+    content,
+    likeCount = '0',
+    time = '03-25',
+    replyTo = null,
+    replyButtonHtml = ''
+}) {
+    const replyMarkup = replyTo ? `
+        <svg class="ZDI ZDI--ArrowRightAlt16 css-gx7lzm"></svg>
+        <a class="css-10u695f" href="https://www.zhihu.com/people/${replyTo}">${replyTo}</a>
+    ` : '';
+
+    return `
+        <div class="CommentItem" data-id="${id}">
+          <a class="UserLink" href="https://www.zhihu.com/people/${id}">${authorName}</a>
+          ${replyMarkup}
+          <div class="CommentContent">${content}</div>
+          <button type="button" class="Button Button--plain Button--grey">${likeCount}</button>
+          <time>${time}</time>
+          ${replyButtonHtml}
+        </div>
+    `;
+}
+
+function buildCommentModal(window, {
+    modalId,
+    rootCommentHtml,
+    scrollHeight = 1800,
+    clientHeight = 360,
+    onClose = () => { }
+}) {
+    const modal = window.document.createElement('div');
+    modal.className = 'css-tpyajk zud-comment-modal';
+    modal.setAttribute('role', 'dialog');
+    modal.dataset.modalId = modalId;
+    modal.innerHTML = `
+        <button type="button" aria-label="关闭">关闭</button>
+        <div class="css-34podr" id="${modalId}-scroll">
+          ${rootCommentHtml}
+        </div>
+    `;
+
+    const scrollContainer = modal.querySelector('.css-34podr');
+    Object.defineProperty(scrollContainer, 'scrollHeight', {
+        value: scrollHeight,
+        configurable: true
+    });
+    Object.defineProperty(scrollContainer, 'clientHeight', {
+        value: clientHeight,
+        configurable: true
+    });
+    scrollContainer.scrollTop = 0;
+
+    modal.querySelector('[aria-label="关闭"]').addEventListener('click', () => {
+        onClose();
+        window.document.querySelectorAll('.zud-comment-modal').forEach(node => node.remove());
+    });
+
+    return modal;
+}
+
+function buildReplyThreadModal(window, {
+    threadId,
+    rootCommentHtml,
+    replyCommentsHtml,
+    scrollHeight = 1400,
+    clientHeight = 280,
+    onClose = () => { }
+}) {
+    const modal = window.document.createElement('div');
+    modal.className = 'css-tpyajk zud-comment-modal zud-reply-modal';
+    modal.setAttribute('role', 'dialog');
+    modal.dataset.threadId = threadId;
+    modal.innerHTML = `
+        <button type="button" aria-label="关闭">关闭</button>
+        <div class="css-1jm49l2">评论回复</div>
+        <div class="css-34podr" id="${threadId}-scroll">
+          ${rootCommentHtml}
+        </div>
+        <div class="css-16zdamy">
+          ${replyCommentsHtml}
+        </div>
+    `;
+
+    const scrollContainer = modal.querySelector('.css-34podr');
+    Object.defineProperty(scrollContainer, 'scrollHeight', {
+        value: scrollHeight,
+        configurable: true
+    });
+    Object.defineProperty(scrollContainer, 'clientHeight', {
+        value: clientHeight,
+        configurable: true
+    });
+    scrollContainer.scrollTop = 0;
+
+    modal.querySelector('[aria-label="关闭"]').addEventListener('click', () => {
+        onClose();
+        window.document.querySelectorAll('.zud-comment-modal').forEach(node => node.remove());
+    });
+
+    return modal;
+}
+
+function attachAnswerCommentModal(window, answerId, createModal, { requireReset = false } = {}) {
+    const answer = window.document.querySelector(`[name="${answerId}"]`);
+    const button = answer?.querySelector('.ContentItem-actions button');
+    assert.ok(button, `Expected a comment button for ${answerId}`);
+
+    button.addEventListener('click', () => {
+        if (requireReset && window.document.querySelector('.zud-comment-modal')) {
+            throw new Error(`Modal was not reset before opening ${answerId}`);
+        }
+
+        const modal = createModal();
+        window.document.body.appendChild(modal);
+    });
+
+    return button;
 }
 
 test('reads comment count from the current action bar button markup', () => {
@@ -633,6 +827,13 @@ test('findReplyThreadRoot recognizes the reply-thread view after a thread is ope
     assert.equal(threadRoot?.id, 'reply-thread-root');
 });
 
+test('getReplyTargetCountFromButton extracts the reply target count from the button label', () => {
+    const { window, api } = loadZhihuTestApi();
+    const button = window.document.createElement('button');
+    button.textContent = '查看全部 31 条回复';
+    assert.equal(api.__getReplyTargetCountFromButton(button), 31);
+});
+
 test('normalizes relative comment times into absolute local dates', () => {
     const { api } = loadZhihuTestApi();
 
@@ -1074,4 +1275,452 @@ test('formatTraceMessage renders scope, stage and key details in one line', () =
     assert.match(line, /answerId=2019449064857580523/);
     assert.match(line, /index=1/);
     assert.match(line, /current=12/);
+});
+
+test('top-N comments export uses live modal comments for each answer and resets between opens', async () => {
+    const { window, downloads } = loadZhihuTestApi(`
+        <!doctype html>
+        <html>
+          <head></head>
+          <body>
+            <div class="QuestionHeader-title">知乎用户脚本如何回归测试？</div>
+            <div class="List-headerText"><span>2 个回答</span></div>
+            <div id="QuestionAnswers-answers">
+              ${buildAnswerMarkup({
+        id: 'answer-1',
+        authorName: 'Alice',
+        commentCount: '12',
+        upvoteCount: '88',
+        time: '2026-03-25 09:00',
+        content: '<p>第一条回答。</p>'
+    })}
+              ${buildAnswerMarkup({
+        id: 'answer-2',
+        authorName: 'Bob',
+        commentCount: '8',
+        upvoteCount: '47',
+        time: '2026-03-25 10:00',
+        content: '<p>第二条回答。</p>'
+    })}
+            </div>
+          </body>
+        </html>
+    `);
+
+    window.document.getElementById('zudInput').value = '2';
+
+    attachAnswerCommentModal(
+        window,
+        'answer-1',
+        () => buildCommentModal(window, {
+            modalId: 'answer-1-modal',
+            rootCommentHtml: buildCommentMarkup({
+                id: 'comment-a1',
+                authorName: '评论者甲',
+                content: '第一条回答的评论',
+                likeCount: '12',
+                time: '03-25'
+            })
+        }),
+        { requireReset: true }
+    );
+
+    attachAnswerCommentModal(
+        window,
+        'answer-2',
+        () => buildCommentModal(window, {
+            modalId: 'answer-2-modal',
+            rootCommentHtml: buildCommentMarkup({
+                id: 'comment-a2',
+                authorName: '评论者乙',
+                content: '第二条回答的评论',
+                likeCount: '8',
+                time: '03-25'
+            })
+        }),
+        { requireReset: true }
+    );
+
+    window.document.getElementById('zudTopNC').click();
+    await waitForCondition(() => downloads.length > 0, { timeoutMs: 10000 });
+
+    const markdown = await readBlobText(downloads[0]);
+    assert.match(markdown, /## 前 2 条回答（含评论）/);
+    assert.match(markdown, /## 回答 1 \| Alice/);
+    assert.match(markdown, /评论者甲/);
+    assert.match(markdown, /## 回答 2 \| Bob/);
+    assert.match(markdown, /评论者乙/);
+});
+
+test('top-N, all-answers, and selected exports keep the same answer metadata shape', async () => {
+    const { window, downloads } = loadZhihuTestApi(`
+        <!doctype html>
+        <html>
+          <head></head>
+          <body>
+            <div class="QuestionHeader-title">知乎回答导出形状一致性测试</div>
+            <div class="List-headerText"><span>3 个回答</span></div>
+            <div id="QuestionAnswers-answers">
+              ${buildAnswerMarkup({
+        id: 'answer-1',
+        authorName: 'Alice',
+        commentCount: '12',
+        upvoteCount: '88',
+        time: '2026-03-25 09:00',
+        content: '<p>第一条回答。</p>'
+    })}
+              ${buildAnswerMarkup({
+        id: 'answer-2',
+        authorName: 'Bob',
+        commentCount: '8',
+        upvoteCount: '47',
+        time: '2026-03-25 10:00',
+        content: '<p>第二条回答。</p>'
+    })}
+              ${buildAnswerMarkup({
+        id: 'answer-3',
+        authorName: 'Carol',
+        commentCount: '5',
+        upvoteCount: '31',
+        time: '2026-03-25 11:00',
+        content: '<p>第三条回答。</p>'
+    })}
+            </div>
+          </body>
+        </html>
+    `);
+
+    window.document.getElementById('zudInput').value = '2';
+    window.document.getElementById('zudTopN').click();
+    await waitForCondition(() => downloads.length === 1, { timeoutMs: 10000 });
+    const topNMarkdown = await readBlobText(downloads[0]);
+
+    window.document.getElementById('downloadAllAnswersButton').click();
+    await waitForCondition(() => downloads.length === 2, { timeoutMs: 10000 });
+    const allMarkdown = await readBlobText(downloads[1]);
+
+    window.document.querySelector('[name="answer-1"] .select-answer-button').click();
+    window.document.querySelector('[name="answer-3"] .select-answer-button').click();
+    window.document.getElementById('downloadSelectedAnswersButton').click();
+    await waitForCondition(() => downloads.length === 3, { timeoutMs: 10000 });
+    const selectedMarkdown = await readBlobText(downloads[2]);
+
+    function extractAnswerBlock(markdown, heading) {
+        const start = markdown.indexOf(heading);
+        assert.ok(start >= 0, `Missing ${heading}`);
+        const end = markdown.indexOf('\n---\n\n', start);
+        assert.ok(end >= 0, `Missing block terminator for ${heading}`);
+        return markdown.slice(start, end);
+    }
+
+    const topNBlock = extractAnswerBlock(topNMarkdown, '## 回答 1 | Alice');
+    const allBlock = extractAnswerBlock(allMarkdown, '## 回答 1 | Alice');
+    const selectedBlock = extractAnswerBlock(selectedMarkdown, '## 回答 1 | Alice');
+
+    assert.equal(topNBlock, allBlock);
+    assert.equal(topNBlock, selectedBlock);
+    assert.match(topNBlock, /\[作者主页\]\(https:\/\/www\.zhihu\.com\/people\/answer-1\)/);
+    assert.match(topNBlock, /\| 赞同 \| 88 \|/);
+    assert.match(topNBlock, /\| 评论 \| 12 \|/);
+    assert.match(topNBlock, /\| 时间 \| 2026-03-25 09:00 \|/);
+    assert.doesNotMatch(topNMarkdown, /## 回答 3 \| Carol/);
+    assert.match(allMarkdown, /## 回答 3 \| Carol/);
+    assert.match(selectedMarkdown, /## 回答 2 \| Carol/);
+});
+
+test('selected answers comments export only includes the chosen answers and their modal comments', async () => {
+    const { window, downloads } = loadZhihuTestApi(`
+        <!doctype html>
+        <html>
+          <head></head>
+          <body>
+            <div class="QuestionHeader-title">知乎问题批量导出测试</div>
+            <div class="List-headerText"><span>3 个回答</span></div>
+            <div id="QuestionAnswers-answers">
+              ${buildAnswerMarkup({
+        id: 'answer-1',
+        authorName: 'Alice',
+        commentCount: '5',
+        upvoteCount: '10',
+        time: '2026-03-25 09:00',
+        content: '<p>回答一。</p>'
+    })}
+              ${buildAnswerMarkup({
+        id: 'answer-2',
+        authorName: 'Bob',
+        commentCount: '6',
+        upvoteCount: '20',
+        time: '2026-03-25 10:00',
+        content: '<p>回答二。</p>'
+    })}
+              ${buildAnswerMarkup({
+        id: 'answer-3',
+        authorName: 'Carol',
+        commentCount: '7',
+        upvoteCount: '30',
+        time: '2026-03-25 11:00',
+        content: '<p>回答三。</p>'
+    })}
+            </div>
+          </body>
+        </html>
+    `);
+
+    const answer1Button = window.document.querySelector('[name="answer-1"] .select-answer-button');
+    const answer2Button = window.document.querySelector('[name="answer-2"] .select-answer-button');
+    const answer3Button = window.document.querySelector('[name="answer-3"] .select-answer-button');
+    assert.ok(answer1Button);
+    assert.ok(answer2Button);
+    assert.ok(answer3Button);
+
+    attachAnswerCommentModal(
+        window,
+        'answer-1',
+        () => buildCommentModal(window, {
+            modalId: 'answer-1-modal',
+            rootCommentHtml: buildCommentMarkup({
+                id: 'comment-s1',
+                authorName: '选中评论甲',
+                content: '选中回答一的评论',
+                likeCount: '5',
+                time: '03-25'
+            })
+        }),
+        { requireReset: true }
+    );
+
+    attachAnswerCommentModal(
+        window,
+        'answer-2',
+        () => buildCommentModal(window, {
+            modalId: 'answer-2-modal',
+            rootCommentHtml: buildCommentMarkup({
+                id: 'comment-s2',
+                authorName: '未选评论',
+                content: '不会导出的评论',
+                likeCount: '6',
+                time: '03-25'
+            })
+        }),
+        { requireReset: true }
+    );
+
+    attachAnswerCommentModal(
+        window,
+        'answer-3',
+        () => buildCommentModal(window, {
+            modalId: 'answer-3-modal',
+            rootCommentHtml: buildCommentMarkup({
+                id: 'comment-s3',
+                authorName: '选中评论乙',
+                content: '选中回答三的评论',
+                likeCount: '7',
+                time: '03-25'
+            })
+        }),
+        { requireReset: true }
+    );
+
+    answer1Button.click();
+    answer3Button.click();
+    assert.equal(window.document.getElementById('downloadSelectedWithCommentsButton').disabled, false);
+
+    window.document.getElementById('downloadSelectedWithCommentsButton').click();
+    await waitForCondition(() => downloads.length > 0, { timeoutMs: 10000 });
+
+    const markdown = await readBlobText(downloads[0]);
+    assert.match(markdown, /## 已选回答 \(2\/2\)/);
+    assert.match(markdown, /## 回答 1 \| Alice/);
+    assert.match(markdown, /选中评论甲/);
+    assert.match(markdown, /## 回答 2 \| Carol/);
+    assert.match(markdown, /选中评论乙/);
+    assert.doesNotMatch(markdown, /## 回答 2 \| Bob/);
+    assert.doesNotMatch(markdown, /不会导出的评论/);
+});
+
+test('comment modal lifecycle resets cleanly between sequential answers', async () => {
+    const { window, api } = loadZhihuTestApi(`
+        <!doctype html>
+        <html>
+          <head></head>
+          <body>
+            <div class="QuestionHeader-title">知乎评论弹窗生命周期测试</div>
+            <div class="List-headerText"><span>2 个回答</span></div>
+            <div id="QuestionAnswers-answers">
+              ${buildAnswerMarkup({
+        id: 'answer-1',
+        authorName: 'Alice',
+        commentCount: '4',
+        upvoteCount: '18',
+        time: '2026-03-25 09:00',
+        content: '<p>第一条回答。</p>'
+    })}
+              ${buildAnswerMarkup({
+        id: 'answer-2',
+        authorName: 'Bob',
+        commentCount: '3',
+        upvoteCount: '21',
+        time: '2026-03-25 10:00',
+        content: '<p>第二条回答。</p>'
+    })}
+            </div>
+          </body>
+        </html>
+    `);
+
+    const sequence = [];
+
+    attachAnswerCommentModal(
+        window,
+        'answer-1',
+        () => {
+            sequence.push('answer-1-open');
+            return buildCommentModal(window, {
+                modalId: 'answer-1-modal',
+                rootCommentHtml: buildCommentMarkup({
+                    id: 'comment-r1',
+                    authorName: '评论者甲',
+                    content: '回答一评论',
+                    likeCount: '4',
+                    time: '03-25'
+                }),
+                onClose: () => {
+                    sequence.push('answer-1-close');
+                }
+            });
+        },
+        { requireReset: true }
+    );
+
+    attachAnswerCommentModal(
+        window,
+        'answer-2',
+        () => {
+            sequence.push('answer-2-open');
+            return buildCommentModal(window, {
+                modalId: 'answer-2-modal',
+                rootCommentHtml: buildCommentMarkup({
+                    id: 'comment-r2',
+                    authorName: '评论者乙',
+                    content: '回答二评论',
+                    likeCount: '3',
+                    time: '03-25'
+                }),
+                onClose: () => {
+                    sequence.push('answer-2-close');
+                }
+            });
+        },
+        { requireReset: true }
+    );
+
+    const answer1 = window.document.querySelector('[name="answer-1"]');
+    const answer2 = window.document.querySelector('[name="answer-2"]');
+
+    const firstComments = await api.__fetchCommentsForAnswer(answer1);
+    const secondComments = await api.__fetchCommentsForAnswer(answer2);
+
+    assert.equal(firstComments[0].author.name, '评论者甲');
+    assert.equal(secondComments[0].author.name, '评论者乙');
+    assert.equal(window.document.querySelector('.zud-comment-modal'), null);
+    assert.deepEqual(sequence, [
+        'answer-1-open',
+        'answer-1-close',
+        'answer-2-open',
+        'answer-2-close'
+    ]);
+});
+
+test('long comment modal scrolls its main list and nested reply thread to the bottom', async () => {
+    const { window, api } = loadZhihuTestApi(`
+        <!doctype html>
+        <html>
+          <head></head>
+          <body>
+            <div class="QuestionHeader-title">知乎长评论测试</div>
+            <div class="List-headerText"><span>1 个回答</span></div>
+            <div id="QuestionAnswers-answers">
+              ${buildAnswerMarkup({
+        id: 'answer-1',
+        authorName: 'Alice',
+        commentCount: '27',
+        upvoteCount: '99',
+        time: '2026-03-25 09:00',
+        content: '<p>带有长评论和回复线程的回答。</p>'
+    })}
+            </div>
+          </body>
+        </html>
+    `);
+
+    let mainScrollContainer = null;
+    let replyScrollContainer = null;
+    let replyThreadOpenCount = 0;
+
+    const modal = buildCommentModal(window, {
+        modalId: 'answer-1-modal',
+        rootCommentHtml: buildCommentMarkup({
+            id: 'comment-root',
+            authorName: '根评论者',
+            content: '这是一个很长的评论根节点。',
+            likeCount: '27',
+            time: '03-25',
+            replyButtonHtml: '<button type="button" class="Button Button--secondary Button--grey">查看全部 2 条回复</button>'
+        }),
+        scrollHeight: 2400,
+        clientHeight: 320
+    });
+
+    mainScrollContainer = modal.querySelector('.css-34podr');
+    const replyButton = modal.querySelector('button.Button--secondary');
+    replyButton.addEventListener('click', () => {
+        replyThreadOpenCount++;
+        const nestedModal = buildReplyThreadModal(window, {
+            threadId: 'answer-1-thread',
+            rootCommentHtml: buildCommentMarkup({
+                id: 'reply-root',
+                authorName: '根评论者',
+                content: '这是回复线程的根评论。',
+                likeCount: '27',
+                time: '03-25'
+            }),
+            replyCommentsHtml: [
+                buildCommentMarkup({
+                    id: 'reply-1',
+                    authorName: '回复者甲',
+                    content: '第一条回复。',
+                    likeCount: '3',
+                    time: '昨天 10:04',
+                    replyTo: '根评论者'
+                }),
+                buildCommentMarkup({
+                    id: 'reply-2',
+                    authorName: '回复者乙',
+                    content: '第二条回复。',
+                    likeCount: '1',
+                    time: '昨天 10:08',
+                    replyTo: '根评论者'
+                })
+            ].join(''),
+            scrollHeight: 1800,
+            clientHeight: 260
+        });
+
+        replyScrollContainer = nestedModal.querySelector('.css-34podr');
+        window.document.body.appendChild(nestedModal);
+    });
+
+    window.document.body.appendChild(modal);
+
+    const comments = [
+        { __commentId: 'comment-root', child_comments_full: [] }
+    ];
+
+    await api.__collectNestedReplies(modal, comments);
+
+    assert.equal(replyThreadOpenCount, 1);
+    assert.equal(comments[0].child_comments_full.length, 2);
+    assert.equal(comments[0].child_comments_full[0].reply_to, '根评论者');
+    assert.equal(mainScrollContainer.scrollTop, mainScrollContainer.scrollHeight - mainScrollContainer.clientHeight);
+    assert.equal(replyScrollContainer.scrollTop, replyScrollContainer.scrollHeight - replyScrollContainer.clientHeight);
 });
