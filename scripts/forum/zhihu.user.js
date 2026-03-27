@@ -908,6 +908,19 @@
         };
     }
 
+    async function __focusAnswerForExtraction(answerEl, details = {}) {
+        if (!answerEl?.scrollIntoView) return;
+        __trace('answer', 'focus', details);
+        try {
+            answerEl.scrollIntoView({ block: 'center', inline: 'nearest' });
+        } catch (_) {
+            try {
+                answerEl.scrollIntoView();
+            } catch (_) { }
+        }
+        await __sleep(120);
+    }
+
     async function __buildAnswersMarkdown(answerElements, {
         batchSize = 10,
         includeComments = false,
@@ -916,35 +929,48 @@
         onMissingComments = () => '',
         onComplete = null
     } = {}) {
+        const preparedAnswers = answerElements
+            .map(answerEl => ({ answerEl, answerData: __collectAnswerExportData(answerEl) }))
+            .filter(({ answerData }) => shouldInclude(answerData));
         const chunks = [];
         let index = 0;
         const exportedAnswerTokens = new Set();
 
-        for (let i = 0; i < answerElements.length; i += batchSize) {
-            const batch = answerElements.slice(i, i + batchSize);
-            for (const answerEl of batch) {
-                const answerData = __collectAnswerExportData(answerEl);
-                if (!shouldInclude(answerData)) continue;
-
+        for (let i = 0; i < preparedAnswers.length; i += batchSize) {
+            const batch = preparedAnswers.slice(i, i + batchSize);
+            for (const { answerEl, answerData } of batch) {
                 index++;
                 if (answerData.answerId) {
                     exportedAnswerTokens.add(answerData.answerId);
                 }
+
+                await __focusAnswerForExtraction(answerEl, {
+                    current: index,
+                    total: preparedAnswers.length,
+                    answerId: answerData.answerId,
+                    author: answerData.authorName,
+                    includeComments: includeComments ? 'yes' : 'no'
+                });
 
                 let commentsMd = '';
                 if (includeComments) {
                     try {
                         if (answerData.answerId) {
                             __trace('answer', 'collect-comments:start', {
-                                index,
+                                current: index,
+                                total: preparedAnswers.length,
                                 answerId: answerData.answerId,
+                                author: answerData.authorName,
                                 commentCount: answerData.commentCount
                             });
                             const comments = await __fetchCommentsForAnswer(answerData.answerId);
                             __trace('answer', 'collect-comments:done', {
-                                index,
+                                current: index,
+                                total: preparedAnswers.length,
                                 answerId: answerData.answerId,
-                                roots: comments.length
+                                author: answerData.authorName,
+                                roots: comments.length,
+                                totalComments: __countCommentsDeep(comments)
                             });
                             commentsMd = __commentsBlockMarkdown(comments);
                         } else {
@@ -1365,13 +1391,17 @@
         const searchRoot = __getAnswerSearchRoot(answerEl);
         const candidates = document.querySelectorAll(SELECTORS.globalCommentRootCandidates);
         const snapshot = new Map();
+        const seen = new Set();
         for (const el of candidates) {
-            if (!el?.querySelector) continue;
-            if (el.hidden) continue;
-            if (el.closest('[hidden]')) continue;
-            if (searchRoot.contains(el)) continue;
-            const count = el.querySelectorAll(SELECTORS.commentItems).length;
-            if (count > 0) snapshot.set(el, count);
+            const normalized = __normalizeCommentsRoot(el);
+            if (!normalized?.querySelector) continue;
+            if (normalized.hidden) continue;
+            if (normalized.closest('[hidden]')) continue;
+            if (searchRoot.contains(normalized)) continue;
+            if (seen.has(normalized)) continue;
+            seen.add(normalized);
+            const count = normalized.querySelectorAll(SELECTORS.commentItems).length;
+            if (count > 0) snapshot.set(normalized, count);
         }
         return snapshot;
     }
@@ -1382,17 +1412,21 @@
         let best = null;
         let bestCount = 0;
         let bestRank = -1;
+        const seen = new Set();
         for (const el of candidates) {
-            if (!el?.querySelector) continue;
-            if (el.hidden) continue;
-            if (el.closest('[hidden]')) continue;
-            if (searchRoot.contains(el)) continue;
-            const count = el.querySelectorAll(SELECTORS.commentItems).length;
+            const normalized = __normalizeCommentsRoot(el);
+            if (!normalized?.querySelector) continue;
+            if (normalized.hidden) continue;
+            if (normalized.closest('[hidden]')) continue;
+            if (searchRoot.contains(normalized)) continue;
+            if (seen.has(normalized)) continue;
+            seen.add(normalized);
+            const count = normalized.querySelectorAll(SELECTORS.commentItems).length;
             if (count === 0) continue;
-            const previous = baseline?.get(el) || 0;
-            const rank = __commentsRootRank(el);
+            const previous = baseline?.get(normalized) || 0;
+            const rank = __commentsRootRank(normalized);
             if (count > previous && (count > bestCount || (count === bestCount && rank > bestRank))) {
-                best = el;
+                best = normalized;
                 bestCount = count;
                 bestRank = rank;
             }
@@ -1408,6 +1442,11 @@
         if (el.matches('.css-18ld3w0')) return 2;
         if (el.matches('[role="dialog"] .Modal-content, .Modal-content, [role="dialog"]')) return 1;
         return 0;
+    }
+
+    function __normalizeCommentsRoot(el) {
+        if (!el?.querySelector) return el || null;
+        return el.matches('.css-tpyajk') ? el : (el.querySelector('.css-tpyajk') || el);
     }
 
     function __findAnswerScopedCommentsRoot(root) {
@@ -1525,8 +1564,19 @@
 
     function __findCommentScrollContainer(root) {
         if (!root?.querySelectorAll) return null;
-        const explicit = root.querySelector(SELECTORS.commentScrollCandidates);
-        if (explicit) return explicit;
+        const explicitCandidates = [root, ...root.querySelectorAll(SELECTORS.commentScrollCandidates)];
+        let best = null;
+        let bestScrollableDelta = -1;
+        for (const el of explicitCandidates) {
+            if (!el) continue;
+            const delta = (el.scrollHeight || 0) - (el.clientHeight || 0);
+            if (delta > bestScrollableDelta) {
+                best = el;
+                bestScrollableDelta = delta;
+            }
+        }
+        if (best && bestScrollableDelta > 24) return best;
+
         const candidates = [root, ...root.querySelectorAll('*')];
         for (const el of candidates) {
             if (el.scrollHeight > el.clientHeight + 24) return el;

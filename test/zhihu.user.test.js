@@ -122,6 +122,7 @@ function loadZhihuTestApi(html = '<!doctype html><html><head></head><body></body
             __isCompleteCommentsRoot,
             __waitForCommentsModalReady,
             __pickExpandedCommentsRoot,
+            __findCommentScrollContainer,
             __collectNestedReplies,
             __findFullCommentsRoot,
             __findAnswerScopedCommentsRoot,
@@ -723,6 +724,38 @@ test('findFreshGlobalCommentsRoot picks a newly appeared portal comments root af
     assert.equal(root?.id, 'portal-comments');
 });
 
+test('findFreshGlobalCommentsRoot prefers the inner full comments panel over the modal wrapper shell', () => {
+    const { window, api } = loadZhihuTestApi(`
+        <!doctype html>
+        <html>
+          <body>
+            <div class="answer-shell" id="shell">
+              <div class="AnswerItem" id="answer-1"></div>
+            </div>
+            <div class="AnswerItem" id="answer-2"></div>
+            <div class="css-1e7fksk" id="modal-shell" hidden>
+              <div class="Modal-content css-1svde17" id="modal-wrapper">
+                <div class="css-tpyajk" id="inner-full-root">
+                  <div class="css-34podr">
+                    <div class="css-18ld3w0">
+                      <div data-id="full-1"><div class="CommentContent">完整评论 1</div></div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </body>
+        </html>
+    `);
+
+    const answer = window.document.getElementById('answer-1');
+    const baseline = api.__snapshotGlobalCommentsRoots(answer);
+    window.document.getElementById('modal-shell').hidden = false;
+
+    const root = api.__findFreshGlobalCommentsRoot(answer, baseline);
+    assert.equal(root?.id, 'inner-full-root');
+});
+
 test('findFreshGlobalCommentsTrigger picks a newly appeared portal trigger when local scope has none', () => {
     const { window, api } = loadZhihuTestApi(`
         <!doctype html>
@@ -855,6 +888,27 @@ test('getDisplayedCommentTotal extracts the total comment count from the modal h
     `;
 
     assert.equal(api.__getDisplayedCommentTotal(root), 495);
+});
+
+test('findCommentScrollContainer prefers the actually scrollable comments root over a non-scrollable wrapper', () => {
+    const { window, api } = loadZhihuTestApi();
+    const modal = window.document.createElement('div');
+    modal.id = 'modal-root';
+    modal.className = 'css-tpyajk';
+    modal.innerHTML = `
+        <div class="css-34podr" id="content-wrapper">
+          <div data-id="comment-1"><div class="CommentContent">评论</div></div>
+        </div>
+    `;
+
+    const wrapper = modal.querySelector('#content-wrapper');
+    Object.defineProperty(wrapper, 'scrollHeight', { value: 200, configurable: true });
+    Object.defineProperty(wrapper, 'clientHeight', { value: 200, configurable: true });
+    Object.defineProperty(modal, 'scrollHeight', { value: 1200, configurable: true });
+    Object.defineProperty(modal, 'clientHeight', { value: 320, configurable: true });
+
+    const scrollContainer = api.__findCommentScrollContainer(modal);
+    assert.equal(scrollContainer?.id, 'modal-root');
 });
 
 test('waitForCommentPanelProgress treats comment item growth as progress even when scroll height does not change', async () => {
@@ -1350,6 +1404,41 @@ test('top-N comments export uses live modal comments for each answer and resets 
     assert.match(markdown, /评论者甲/);
     assert.match(markdown, /## 回答 2 \| Bob/);
     assert.match(markdown, /评论者乙/);
+});
+
+test('top-N comments export scrolls the current answer into view before extracting comments', async () => {
+    const { window, downloads } = loadZhihuTestApi(`
+        <!doctype html>
+        <html>
+          <head></head>
+          <body>
+            <div class="QuestionHeader-title">知乎回答聚焦测试</div>
+            <div class="List-headerText"><span>1 个回答</span></div>
+            <div id="QuestionAnswers-answers">
+              ${buildAnswerMarkup({
+        id: 'answer-1',
+        authorName: 'Alice',
+        commentCount: '0',
+        upvoteCount: '12',
+        time: '2026-03-25 09:00',
+        content: '<p>第一条回答。</p>'
+    })}
+            </div>
+          </body>
+        </html>
+    `);
+
+    let focusCalls = 0;
+    const answer = window.document.querySelector('[name="answer-1"]');
+    answer.scrollIntoView = () => {
+        focusCalls++;
+    };
+
+    window.document.getElementById('zudInput').value = '1';
+    window.document.getElementById('zudTopNC').click();
+    await waitForCondition(() => downloads.length > 0, { timeoutMs: 10000 });
+
+    assert.equal(focusCalls > 0, true);
 });
 
 test('top-N, all-answers, and selected exports keep the same answer metadata shape', async () => {
