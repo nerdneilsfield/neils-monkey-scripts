@@ -6,8 +6,8 @@
 // @author       Qi Deng
 // @match        https://www.reddit.com/r/*/comments/*
 // @require      https://cdn.jsdelivr.net/npm/turndown@7.2.0/lib/turndown.umd.js#sha256-bNU+0rwWe4WVADj+kwuhXm7nhfx2/c/hbaHk979TOpw=
-// @downloadURL  https://github.com/nerdneilsfield/neils-monkey-scripts/raw/refs/heads/master/forum/reddit.user.js
-// @updateURL    https://github.com/nerdneilsfield/neils-monkey-scripts/raw/refs/heads/master/forum/reddit.user.js
+// @downloadURL  https://github.com/nerdneilsfield/neils-monkey-scripts/raw/refs/heads/master/scripts/forum/reddit.user.js
+// @updateURL    https://github.com/nerdneilsfield/neils-monkey-scripts/raw/refs/heads/master/scripts/forum/reddit.user.js
 // @run-at       document-idle
 // @grant        none
 // @noframes
